@@ -2,6 +2,15 @@
 
 Open Computer Use's nine native computer tools **plus our Hermes backend and Desktop live viewer**: per-window screen share, native cursor tracking, Stop, Take over / Hand back. One package carries both `__init__.py` and `desktop/plugin.js`.
 
+**This is the current Open Computer Use MCP integration, not the retired cua-driver backend.**
+
+```text
+Hermes agent → our adapter → OpenComputerUse mcp (open-computer-use 0.3.6)
+                    └────→ our live-view bridge → desktop/plugin.js
+```
+
+The tool adapter and Desktop viewer are the active Hermes implementation. Only installation-path handling changes for portability.
+
 ## Install
 
 Requires **Hermes Desktop 0.21.6 or newer, Apple Silicon macOS, Python 3 and Node.js >=18/npm**. This integration's window capture and viewer are macOS-specific even though upstream Open Computer Use has other platform builds. Verified against upstream Hermes `1fd18277267152893a8a24792b79213e7ca3f899`; internal API changes in later Hermes releases may require updates. No Hermes core patch is needed.

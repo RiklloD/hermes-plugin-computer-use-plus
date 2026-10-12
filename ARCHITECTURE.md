@@ -67,5 +67,4 @@ server · `commands.py` `/computer-view` · `trace.py` one line per call in `log
     HERMES_HOME=$(mktemp -d) PYTHONPATH=~/.hermes/hermes-agent <hermes test python> -m pytest -q -p no:xdist plugins/computer-use-plus/tests
     HERMES_HOME=$(mktemp -d) <hermes test python> -I plugins/computer-use-plus/evals/run.py   # live, Calculator
 
-0.4.2 (cua-driver backend with observe/run/fill/verify/web_* actions) is backed up at
-`~/.hermes/backups/computer-use-plus-0.4.2`.
+This distribution contains only the current Open Computer Use MCP integration. The retired cua-driver implementation is not included.
