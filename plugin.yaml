@@ -1,0 +1,34 @@
+name: computer-use-plus
+label: Computer Use Plus
+kind: standalone
+version: 0.5.1
+description: >-
+  Codex computer use for Hermes. The model gets Open Computer Use's nine native tools exactly as its MCP server
+  defines them (list_apps, get_app_state, click, perform_secondary_action, scroll, drag, type_text, press_key,
+  set_value), loaded eagerly, with the server's instructions in the system prompt, and the native Codex-style cursor
+  on screen. With the tools.override grant, Hermes's cua-driver computer_use is hidden. Adds a live screen share of
+  the windows the agent drives in Hermes Desktop, with Stop (aborts an in-flight action) and Take over / Hand back.
+author: Lorik Dalloshi
+requires_hermes: ">=0.21.6"
+provides_tools:
+  - list_apps
+  - get_app_state
+  - click
+  - perform_secondary_action
+  - scroll
+  - drag
+  - type_text
+  - press_key
+  - set_value
+  - computer_use
+capabilities:
+  - tools.override
+provides_hooks:
+  - on_session_end
+  - post_llm_call
+requires_env: []
+config_schema:
+  live_preview:
+    type: bool
+    default: true
+    description: Screen-share the windows the agent drives (with its cursor) to the Hermes Desktop viewer over an authenticated localhost server.

@@ -1,0 +1,30 @@
+name: Plugin checks
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      HERMES_HOME: ${{ github.workspace }}/.test-home
+      HOME: ${{ github.workspace }}/.native-home
+      HERMES_RUNTIME_DIR: ${{ github.workspace }}/.test-runtime
+      PYTHONPATH: ${{ github.workspace }}/hermes-agent
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: NousResearch/hermes-agent
+          ref: 1fd18277267152893a8a24792b79213e7ca3f899
+          path: hermes-agent
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+      - name: Desktop syntax
+        run: node --input-type=module --check < desktop/plugin.js
+      - name: Backend tests (Hermes-managed test environment)
+        run: bash hermes-agent/scripts/run-in-hermes-env bash -c '"$__HERMES_TEST_PYTHON" -m pytest "$GITHUB_WORKSPACE/tests" -q -p no:xdist'

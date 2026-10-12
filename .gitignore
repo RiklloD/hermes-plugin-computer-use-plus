@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+node_modules/
+.env
+.env.*
+*.db
+*.db-*
+*.sqlite*
+*.jsonl
+.DS_Store
+.hermes-package.json
+hermes-agent/
+.test-home/
+.native-home/
+.test-runtime/

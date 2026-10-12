@@ -1,0 +1,22 @@
+{
+  "source": "Installed plugin snapshot; runtime state excluded",
+  "files": {
+    "trace.py": "d310cb433e69c3e93b3bf55eb6835edb6a179fc3b88c3ac3fea4bbef8f4706f3",
+    "pytest.ini": "ff93bab86d344ff5ced12ebb6ac2e39788dfefa874a766286f89c102af5345e4",
+    "codex.py": "2011189feec6df333d9982058b34e6a76ec3bcd5d79b89e2c5ac3d84850ad286",
+    "plugin.yaml": "395778380da869fb4d9cc32e937b40a133e26edd04aca7a7963a36c754b71a87",
+    "__init__.py": "1c3fe3e485a7c8fd3541c5c108a51b9b0c900cc351cf292a84a310976b0f6879",
+    "ocu.py": "f3f045f10262cee64e753495d06f6c637e6396bd52fd1a3f038e7a658cb7518d",
+    "stream.py": "631802372ef698c38b10284e09798e73c941cc55d89834726464d099ef7dd56a",
+    "README.md": "b283f6d13a57595f1b2e5ae118cbc3ecf980030fcd5a74ea6cccf7af101f5fa8",
+    "codex_tools.json": "7abf4bc421927868f2adf63b6965d9f6aa24ba0fb306f9f349014965c1abfaa7",
+    "live.py": "f2cacfcb96fa869ceb2792c6cb4548b41e5fbca423fab71c3939c88de5a12c51",
+    "windows.py": "41d2a0c9af1cd0ff56e3881c474ef2611d13c63a7fcca767c6a3bf378a01f056",
+    "commands.py": "0b41eecb278b77831669f44bcccf6150c8a9521165e74e81fcad0e603dc1fc21",
+    "evals/run.py": "3f80a65262bfe948dcc54bb13723ec5df5d998cd84b6ccd806b325a5b39aea71",
+    "tests/conftest.py": "68be1d56ed9c1a70fe03267581493ac10e0a37c85543802032914a5f05235127",
+    "tests/test_viewer.py": "c0aba6368cda33e05a54dbe8cfe75fe1031e8fcc86419a516d4ceae144e6a28b",
+    "tests/test_codex.py": "59180100f9716523a0979cbe1744adcf29e79d727d781d01e5d03b18e1af348c",
+    "desktop/plugin.js": "51fec693d91cddc9cd40df2041fe18ff27e4d82eb69d3a1c3a105cd4213a239a"
+  }
+}

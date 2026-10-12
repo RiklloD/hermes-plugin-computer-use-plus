@@ -1,0 +1,6 @@
+{
+  "private": true,
+  "dependencies": {
+    "open-computer-use": "0.3.6"
+  }
+}

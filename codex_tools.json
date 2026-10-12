@@ -1,0 +1,316 @@
+{
+ "source": "open-computer-use 0.3.6 `OpenComputerUse mcp` tools/list + initialize.instructions (verbatim)",
+ "instructions": "Computer Use tools let you interact with macOS apps by performing UI actions.\n\nSome apps might have a separate dedicated plugin or skill. You may want to use that plugin or skill instead of Computer Use when it seems like a good fit for the task. While the separate plugin or skill may not expose every feature in the app, if the plugin can perform the task with its available features, prefer it. If the needed capability is not exposed there, use Computer Use may be appropriate for the missing interaction.\n\nBegin by calling `get_app_state` every turn you want to use Computer Use to get the latest state before acting. Codex will automatically stop the session after each assistant turn, so this step is required before interacting with apps in a new assistant turn.\n\nThe available tools are list_apps, get_app_state, click, perform_secondary_action, scroll, drag, type_text, press_key, and set_value. If any of these are not available in your environment, use tool_search to surface one before calling any Computer Use action tools.\n\nComputer Use tools allow you to use the user's apps in the background, so while you're using an app, the user can continue to use other apps on their computer. Avoid doing anything that would disrupt the user's active session, such as overwriting the contents of their clipboard, unless they asked you to!\n\nAfter each action, use the action result or fetch the latest state to verify the UI changed as expected.\nPrefer element-targeted interactions over coordinate clicks when an index for the targeted element is available. Note that element indices are the sequential integers from the app state's accessibility tree.\nAvoid falling back to AppleScript during a computer use session. Prefer Computer Use tools as much as possible to complete tasks.\nAsk the user before taking destructive or externally visible actions such as sending, deleting, or purchasing. If helpful, you can ask follow-up questions before taking action to make sure you’re understanding the user’s request correctly.",
+ "tools": [
+  {
+   "annotations": {
+    "openWorldHint": false,
+    "readOnlyHint": true,
+    "destructiveHint": false,
+    "idempotentHint": true
+   },
+   "inputSchema": {
+    "properties": {},
+    "type": "object",
+    "additionalProperties": false
+   },
+   "description": "List the apps on this computer. Returns the set of apps that are currently running, as well as any that have been used in the last 14 days, including details on usage frequency. This tool is part of plugin `Computer Use`.",
+   "name": "list_apps"
+  },
+  {
+   "name": "get_app_state",
+   "annotations": {
+    "readOnlyHint": true,
+    "destructiveHint": false,
+    "idempotentHint": true,
+    "openWorldHint": false
+   },
+   "inputSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+     "app"
+    ],
+    "properties": {
+     "text_limit": {
+      "anyOf": [
+       {
+        "minimum": 1,
+        "type": "integer"
+       },
+       {
+        "type": "string",
+        "enum": [
+         "max"
+        ]
+       }
+      ],
+      "description": "Maximum text characters to return. Use \"max\" for full text. Defaults to 500."
+     },
+     "max_tree_nodes": {
+      "description": "Maximum accessibility tree nodes to render. Defaults to 1200.",
+      "type": "integer",
+      "minimum": 1
+     },
+     "app": {
+      "type": "string",
+      "description": "App name or bundle identifier"
+     },
+     "max_tree_depth": {
+      "minimum": 1,
+      "description": "Maximum accessibility tree depth to render. Defaults to 64.",
+      "type": "integer"
+     }
+    }
+   },
+   "description": "Start an app use session if needed, then get the state of the app's key window and return a screenshot and accessibility tree. This must be called once per assistant turn before interacting with the app. This tool is part of plugin `Computer Use`."
+  },
+  {
+   "annotations": {
+    "openWorldHint": false,
+    "destructiveHint": false
+   },
+   "inputSchema": {
+    "additionalProperties": false,
+    "required": [
+     "app"
+    ],
+    "type": "object",
+    "properties": {
+     "mouse_button": {
+      "type": "string",
+      "description": "Mouse button to click. Defaults to left.",
+      "enum": [
+       "left",
+       "right",
+       "middle"
+      ]
+     },
+     "app": {
+      "description": "App name or bundle identifier",
+      "type": "string"
+     },
+     "element_index": {
+      "type": "string",
+      "description": "Element index to click"
+     },
+     "y": {
+      "description": "Y coordinate in screenshot pixel coordinates",
+      "type": "number"
+     },
+     "x": {
+      "description": "X coordinate in screenshot pixel coordinates",
+      "type": "number"
+     },
+     "click_method": {
+      "enum": [
+       "auto",
+       "accessibility",
+       "app_post",
+       "sky_click",
+       "global"
+      ],
+      "type": "string",
+      "description": "Click implementation: auto (default), accessibility, app_post, sky_click, or global. Accessibility requires element_index. app_post sends a public event directly to the target app. sky_click uses the macOS SkyLight background window path. Global may move the system pointer and requires OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS=1."
+     },
+     "click_count": {
+      "type": "integer",
+      "description": "Number of clicks. Defaults to 1"
+     }
+    }
+   },
+   "description": "Click an element by index or pixel coordinates from screenshot. This tool is part of plugin `Computer Use`.",
+   "name": "click"
+  },
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "openWorldHint": false
+   },
+   "name": "perform_secondary_action",
+   "description": "Invoke a secondary accessibility action exposed by an element. This tool is part of plugin `Computer Use`.",
+   "inputSchema": {
+    "required": [
+     "app",
+     "element_index",
+     "action"
+    ],
+    "additionalProperties": false,
+    "type": "object",
+    "properties": {
+     "action": {
+      "description": "Secondary accessibility action name",
+      "type": "string"
+     },
+     "app": {
+      "description": "App name or bundle identifier",
+      "type": "string"
+     },
+     "element_index": {
+      "type": "string",
+      "description": "Element identifier"
+     }
+    }
+   }
+  },
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "openWorldHint": false
+   },
+   "name": "scroll",
+   "description": "Scroll an element in a direction by a number of pages. This tool is part of plugin `Computer Use`.",
+   "inputSchema": {
+    "additionalProperties": false,
+    "type": "object",
+    "properties": {
+     "direction": {
+      "type": "string",
+      "description": "Scroll direction: up, down, left, or right"
+     },
+     "element_index": {
+      "type": "string",
+      "description": "Element identifier"
+     },
+     "app": {
+      "type": "string",
+      "description": "App name or bundle identifier"
+     },
+     "pages": {
+      "description": "Number of pages to scroll. Fractional values are supported. Defaults to 1",
+      "type": "number"
+     }
+    },
+    "required": [
+     "app",
+     "element_index",
+     "direction"
+    ]
+   }
+  },
+  {
+   "name": "drag",
+   "inputSchema": {
+    "type": "object",
+    "required": [
+     "app",
+     "from_x",
+     "from_y",
+     "to_x",
+     "to_y"
+    ],
+    "additionalProperties": false,
+    "properties": {
+     "from_y": {
+      "type": "number",
+      "description": "Start Y coordinate"
+     },
+     "app": {
+      "type": "string",
+      "description": "App name or bundle identifier"
+     },
+     "from_x": {
+      "type": "number",
+      "description": "Start X coordinate"
+     },
+     "to_y": {
+      "description": "End Y coordinate",
+      "type": "number"
+     },
+     "to_x": {
+      "type": "number",
+      "description": "End X coordinate"
+     }
+    }
+   },
+   "description": "Drag from one point to another using pixel coordinates. By default mouse events are posted directly to the target app and the system pointer does not move; that path cannot drive window-server drag sessions such as window moves, text selection, or Finder drag-and-drop. Those require OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS=1 in the server process environment, which may move the real pointer. The result reports which path was used. This tool is part of plugin `Computer Use`.",
+   "annotations": {
+    "destructiveHint": false,
+    "openWorldHint": false
+   }
+  },
+  {
+   "name": "type_text",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {
+     "app": {
+      "type": "string",
+      "description": "App name or bundle identifier"
+     },
+     "text": {
+      "description": "Literal text to type",
+      "type": "string"
+     }
+    },
+    "type": "object",
+    "required": [
+     "app",
+     "text"
+    ]
+   },
+   "description": "Type literal text using keyboard input. This tool is part of plugin `Computer Use`.",
+   "annotations": {
+    "destructiveHint": false,
+    "openWorldHint": false
+   }
+  },
+  {
+   "description": "Press a key or key-combination on the keyboard, including modifier and navigation keys.\n  - This supports xdotool's `key` syntax.\n  - Examples: \"a\", \"Return\", \"Tab\", \"super+c\", \"Up\", \"KP_0\" (for the numpad 0 key). This tool is part of plugin `Computer Use`.",
+   "annotations": {
+    "destructiveHint": false,
+    "openWorldHint": false
+   },
+   "name": "press_key",
+   "inputSchema": {
+    "properties": {
+     "key": {
+      "type": "string",
+      "description": "Key or key combination to press"
+     },
+     "app": {
+      "type": "string",
+      "description": "App name or bundle identifier"
+     }
+    },
+    "additionalProperties": false,
+    "type": "object",
+    "required": [
+     "app",
+     "key"
+    ]
+   }
+  },
+  {
+   "annotations": {
+    "openWorldHint": false,
+    "destructiveHint": false
+   },
+   "name": "set_value",
+   "description": "Set the value of a settable accessibility element. This tool is part of plugin `Computer Use`.",
+   "inputSchema": {
+    "additionalProperties": false,
+    "required": [
+     "app",
+     "element_index",
+     "value"
+    ],
+    "type": "object",
+    "properties": {
+     "value": {
+      "description": "Value to assign",
+      "type": "string"
+     },
+     "app": {
+      "type": "string",
+      "description": "App name or bundle identifier"
+     },
+     "element_index": {
+      "type": "string",
+      "description": "Element identifier"
+     }
+    }
+   }
+  }
+ ]
+}
