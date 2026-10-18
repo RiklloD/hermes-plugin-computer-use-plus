@@ -1,0 +1,5 @@
+{
+  "repository": "https://github.com/iFurySt/open-computer-use.git",
+  "commit": "5136415f52b87f419227bae28767cf469a6bc3b5",
+  "note": "upstream main after v1.1.2 (includes #68 select_text and #101 selective AX/screenshot collection); engine/patches apply on top with git am"
+}

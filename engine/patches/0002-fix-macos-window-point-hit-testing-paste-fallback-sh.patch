@@ -1,0 +1,127 @@
+From 8d506a5096dcb570e375cacf0b9391f2a85ec924 Mon Sep 17 00:00:00 2001
+From: Lorik Dalloshi <lorik@Loriks-MacBook-Pro.local>
+Date: Sun, 18 Oct 2026 22:56:00 +0200
+Subject: [PATCH 2/2] fix(macos): window-point hit testing, paste fallback,
+ sheet click guard
+
+- hitTestElement receives window points from every caller but converted
+  them as screenshot pixels: wrong probe point whenever the screenshot is
+  scaled, and an error when the screenshot was skipped.
+- type_text method=paste falls back to keystrokes when the app ignores
+  Cmd+V (background apps), and any type_text without a known field says
+  the result is unverified.
+- Element clicks are refused while a sheet covers the window, instead of
+  pressing a sheet button that sits over the element.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../ComputerUseService.swift                  | 51 +++++++++++++++++--
+ 1 file changed, 48 insertions(+), 3 deletions(-)
+
+diff --git a/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/ComputerUseService.swift b/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/ComputerUseService.swift
+index a6e8757..4e623a0 100644
+--- a/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/ComputerUseService.swift
++++ b/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/ComputerUseService.swift
+@@ -722,6 +722,7 @@ public final class ComputerUseService {
+ 
+         if let elementIndex {
+             let record = try lookupElement(snapshot: snapshot, index: elementIndex)
++            try requireNotCoveredBySheet(record, in: snapshot)
+             guard let windowPoint = clickPoint(for: record, snapshot: snapshot) else {
+                 throw ComputerUseError.stateUnavailable("element \(elementIndex) has no clickable frame")
+             }
+@@ -844,7 +845,7 @@ public final class ComputerUseService {
+                 throw error
+             }
+ 
+-            rememberTextTarget(((try? hitTestElement(at: screenshotPoint, in: snapshot)) ?? nil)?.element, pid: snapshot.app.pid)
++            rememberTextTarget(((try? hitTestElement(at: point, in: snapshot)) ?? nil)?.element, pid: snapshot.app.pid)
+             pulseVisualCursor(at: cursorTarget, clickCount: clickCount, mouseButton: button)
+         } else {
+             throw ComputerUseError.invalidArguments("click requires either element_index or x/y")
+@@ -994,11 +995,20 @@ public final class ComputerUseService {
+         if let target, method != .keys {
+             focusTextTarget(target)
+         }
++        var notes: [String] = []
+         switch method {
+         case .paste:
+             try InputSimulation.pasteText(text) {
+                 try deliverKey("cmd+v", keyMethod: keyMethod, snapshot: snapshot)
+             }
++            // Background apps often ignore Cmd+V (key equivalents need an active
++            // menu bar); typing is the dependable fallback.
++            if let target, case .unchanged = awaitWrite(on: target, timeout: 0.3, classify: {
++                classifyTextInsertion(typed: text, before: before, after: $0)
++            }) {
++                notes.append("Paste was ignored by the app (common for background apps); typed the text instead.")
++                try InputSimulation.typeText(text, pid: pid)
++            }
+         case .auto, .keys:
+             if keyMethod == .skyKey {
+                 let skyTarget = try skyKeyTarget(for: snapshot)
+@@ -1008,7 +1018,9 @@ public final class ComputerUseService {
+             }
+         }
+ 
+-        var notes: [String] = []
++        if target == nil {
++            notes.append("Unverified: no text field was identified, so whether the text landed cannot be checked. Confirm with get_app_state before relying on it.")
++        }
+         if let target {
+             switch awaitWrite(on: target, timeout: 0.5, classify: { classifyTextInsertion(typed: text, before: before, after: $0) }) {
+             case .confirmed, .unreadable:
+@@ -1022,6 +1034,36 @@ public final class ComputerUseService {
+         return try actionResult(for: query, recoveryPolicy: recoveryPolicy, notes: notes)
+     }
+ 
++    /// A sheet (save prompt, alert) over the window takes every click aimed at
++    /// the window beneath it, so a click on an element behind the sheet would
++    /// press one of the sheet's buttons instead. Refuse it.
++    private func requireNotCoveredBySheet(_ record: ElementRecord, in snapshot: AppSnapshot) throws {
++        guard let window = snapshot.windowElement, let element = record.element,
++              let children = copyChildren(of: window) else {
++            return
++        }
++        let sheets = children.filter { stringValue(of: $0, attribute: kAXRoleAttribute) == "AXSheet" }
++        guard !sheets.isEmpty else { return }
++        var current: AXUIElement? = element
++        for _ in 0..<64 {
++            guard let node = current else { break }
++            if sheets.contains(where: { CFEqual($0, node) }) { return }
++            current = copyParent(of: node)
++        }
++        throw ComputerUseError.stateUnavailable(
++            "A sheet or dialog is covering this window, so a click on element \(record.index) would land on the dialog instead. "
++                + "Handle the dialog first (its buttons are in the tree), then call get_app_state again."
++        )
++    }
++
++    private func copyChildren(of element: AXUIElement) -> [AXUIElement]? {
++        var raw: CFTypeRef?
++        guard AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &raw) == .success else {
++            return nil
++        }
++        return raw as? [AXUIElement]
++    }
++
+     private func deliverKey(_ key: String, keyMethod: KeyMethod, snapshot: AppSnapshot) throws {
+         if keyMethod == .skyKey {
+             let target = try skyKeyTarget(for: snapshot)
+@@ -1827,9 +1869,12 @@ public final class ComputerUseService {
+             .first
+     }
+ 
++    /// `point` is window-local (every caller passes window points), so it maps to
++    /// the screen without going through screenshot pixels, which differ under
++    /// scaling and do not exist when the screenshot was skipped.
+     private func hitTestElement(at point: CGPoint, in snapshot: AppSnapshot) throws -> ElementRecord? {
+         let appElement = AXUIElementCreateApplication(snapshot.app.pid)
+-        let globalPoint = try screenshotToGlobalPoint(snapshot: snapshot, x: Double(point.x), y: Double(point.y))
++        let globalPoint = try windowPointToGlobalPoint(snapshot: snapshot, point: point)
+         var hitElement: AXUIElement?
+         let result = AXUIElementCopyElementAtPosition(appElement, Float(globalPoint.x), Float(globalPoint.y), &hitElement)
+         guard result == .success, let hitElement else {
+-- 
+2.54.0 (Apple Git-157)
+

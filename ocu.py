@@ -25,28 +25,50 @@ START_TIMEOUT = 20.0
 IDLE_REAP = 900.0
 
 _ENV_INSTALL = "HERMES_OCU_HOME"
-_APP_BINARY = ("node_modules", "open-computer-use", "dist", "Open Computer Use.app", "Contents", "MacOS",
-               "OpenComputerUse")
+_DIST = ("node_modules", "open-computer-use", "dist")
+_EXE = ("Contents", "MacOS", "OpenComputerUse")
+# The patched engine (scripts/build-engine.py, Dev bundle identity) wins over the stock npm app.
+_APP_NAMES = ("Open Computer Use (Dev).app", "Open Computer Use.app")
+_APP_BINARY = (*_DIST, _APP_NAMES[1], *_EXE)
+# The patched engine's own app-agent socket, so it never talks to (or replaces) the stock app's agent.
+FORK_SOCKET_NAMESPACE = "hermes"
+
+
+def _app_binary(root: Path) -> Optional[Path]:
+    """The engine under `root`: a build output (`root/<App>`) or an npm-style install (`root/node_modules/...`)."""
+    for name in _APP_NAMES:
+        for path in (root.joinpath(name, *_EXE), root.joinpath(*_DIST, name, *_EXE)):
+            if path.is_file():
+                return path
+    return None
 
 
 def install_dir() -> Path:
-    """Where `npm i open-computer-use` put it: one install shared by every profile (profiles symlink this plugin),
-    so it sits under the Hermes root's tools/, next to the plugin's real directory, not a profile's home."""
+    """Where the engine is. In order: the patched engine built into this plugin (engine/dist), a shared patched
+    build under the Hermes root's tools/, the plugin-local npm backend, then a shared stock npm install."""
     if os.environ.get(_ENV_INSTALL):
         return Path(os.environ[_ENV_INSTALL]).expanduser()
-    candidates = [Path(__file__).resolve().parent / "backend",
-                  Path(__file__).resolve().parents[2] / "tools" / "open-computer-use"]
+    here = Path(__file__).resolve().parent
+    roots = [Path(__file__).resolve().parents[2]]
     try:
         from hermes_constants import get_default_hermes_root
-        candidates.append(Path(get_default_hermes_root()) / "tools" / "open-computer-use")
+        roots.append(Path(get_default_hermes_root()))
     except Exception:
         pass
-    return next((c for c in candidates if c.joinpath(*_APP_BINARY).is_file()), candidates[0])
+    candidates = [here / "engine" / "dist", *(r / "tools" / "open-computer-use-hermes" for r in roots),
+                  here / "backend", *(r / "tools" / "open-computer-use" for r in roots)]
+    return next((c for c in candidates if _app_binary(c) is not None), here / "backend")
 
 
 def binary() -> Optional[Path]:
-    path = install_dir().joinpath(*_APP_BINARY)
-    return path if path.is_file() and os.access(path, os.X_OK) else None
+    path = _app_binary(install_dir())
+    return path if path is not None and os.access(path, os.X_OK) else None
+
+
+def is_fork() -> bool:
+    """Whether the patched engine (its extra tools and OPEN_COMPUTER_USE_ACTION_* switches) is the one in use."""
+    path = binary()
+    return path is not None and "(Dev).app" in str(path)
 
 
 def available() -> bool:
@@ -81,6 +103,8 @@ class Client:
         if exe is None:
             raise OCUError(f"Open Computer Use is not installed (expected under {install_dir()}).")
         env = {**os.environ, **self._env}
+        if is_fork():
+            env.setdefault("OPEN_COMPUTER_USE_AGENT_SOCKET_NAMESPACE", FORK_SOCKET_NAMESPACE)
         self._proc = subprocess.Popen([str(exe), "mcp"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                       stderr=subprocess.DEVNULL, env=env, close_fds=True)
         self._buf = b""
