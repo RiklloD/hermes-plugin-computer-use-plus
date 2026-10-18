@@ -10,6 +10,7 @@ native cursor went.
 from __future__ import annotations
 
 import base64
+import contextvars
 import json
 import logging
 import os
@@ -290,8 +291,15 @@ class _CursorWatch:
 
 # ── results ──
 
+# Set by a caller that knows its model better than the Hermes config does (the Claude CLI bridge: Claude takes
+# images, whatever the profile's main model is).
+IMAGES_OVERRIDE: contextvars.ContextVar[Optional[bool]] = contextvars.ContextVar("cup_images_override", default=None)
+
+
 def _images_native() -> bool:
     """Whether the main model takes images in tool results (the same gate core's computer_use uses)."""
+    if (override := IMAGES_OVERRIDE.get()) is not None:
+        return override
     try:
         from agent.auxiliary_client import _read_main_model, _read_main_provider
         from hermes_cli.config import load_config_readonly
