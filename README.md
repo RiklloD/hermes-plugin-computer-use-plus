@@ -1,11 +1,11 @@
 # Computer Use Plus for Hermes
 
-Open Computer Use's nine native computer tools **plus our Hermes backend and Desktop live viewer**: per-window screen share, native cursor tracking, Stop, Take over / Hand back. One package carries both `__init__.py` and `desktop/plugin.js`.
+Open Computer Use's native computer tools on a **patched engine** (verified writes, window pinning, diff results; see [engine/README.md](engine/README.md)) **plus our Hermes backend and Desktop live viewer**: per-window screen share, native cursor tracking, Stop, Take over / Hand back. One package carries both `__init__.py` and `desktop/plugin.js`.
 
 **This is the current Open Computer Use MCP integration, not the retired cua-driver backend.**
 
 ```text
-Hermes agent → our adapter → OpenComputerUse mcp (open-computer-use 0.3.6)
+Hermes agent → our adapter → OpenComputerUse mcp (patched Open Computer Use, engine/patches)
                     └────→ our live-view bridge → desktop/plugin.js
 ```
 
@@ -13,31 +13,33 @@ The tool adapter and Desktop viewer are the active Hermes implementation. Only i
 
 ## Install
 
-Requires **Hermes Desktop 0.21.6 or newer, Apple Silicon macOS, Python 3 and Node.js >=18/npm**. This integration's window capture and viewer are macOS-specific even though upstream Open Computer Use has other platform builds. Verified against upstream Hermes `1fd18277267152893a8a24792b79213e7ca3f899`; internal API changes in later Hermes releases may require updates. No Hermes core patch is needed.
+Requires **Hermes Desktop 0.21.6 or newer, Apple Silicon macOS, Python 3, Xcode Command Line Tools (`xcode-select --install`) and openssl**. This integration's window capture and viewer are macOS-specific even though upstream Open Computer Use has other platform builds. Verified against upstream Hermes `1fd18277267152893a8a24792b79213e7ca3f899`; internal API changes in later Hermes releases may require updates. No Hermes core patch is needed.
 
 ```sh
 hermes plugins install RiklloD/hermes-plugin-computer-use-plus --no-enable
-python3 "${HERMES_HOME:-$HOME/.hermes}/plugins/computer-use-plus/scripts/install-backend.py"
+python3 "${HERMES_HOME:-$HOME/.hermes}/plugins/computer-use-plus/scripts/build-engine.py"
 hermes plugins enable computer-use-plus
 ```
 
 Run the last command interactively to review the `tools.override` capability. With your consent, it hides Hermes's built-in cua-driver tool so the model has one computer-use interface. Without consent both interfaces remain visible. Ensure **Computer Use** is enabled for your chat surface in `hermes tools`.
 
-Restart Hermes Desktop/backend; enable **Computer Use Plus** in **Capabilities → Plugins**. Grant **Open Computer Use** Accessibility and Screen Recording in macOS System Settings when requested—only you can grant them. `/computer-view` reports tool/server/viewer readiness. The **Computer** status-bar chip shows the viewer.
+Restart Hermes Desktop/backend; enable **Computer Use Plus** in **Capabilities → Plugins**. Grant **Open Computer Use (Dev)** (the patched engine) Accessibility and Screen Recording in macOS System Settings when requested—only you can grant them. `/computer-view` reports tool/server/viewer readiness. The **Computer** status-bar chip shows the viewer.
 
-Do **not** add a second `mcp_servers.open-computer-use` entry: this plugin manages the native MCP process. If an old raw entry is enabled, disable it through Hermes's MCP settings. The install script only runs `npm ci --ignore-scripts` against the bundled lockfile and checks the executable; it does not edit configuration, native permissions or a Hermes checkout.
+Do **not** add a second `mcp_servers.open-computer-use` entry: this plugin manages the native MCP process. If an old raw entry is enabled, disable it through Hermes's MCP settings. `build-engine.py` clones the pinned upstream commit (`engine/UPSTREAM.json`), applies `engine/patches` with `git am`, builds with SwiftPM and signs with a local self-signed identity kept in a dedicated keychain under `tools/ocu-signing` in the Hermes root (stable across rebuilds, so macOS keeps the grants). It does not edit configuration, native permissions or a Hermes checkout.
+
+**Stock engine instead:** `scripts/install-backend.py` still installs unmodified open-computer-use 0.3.6 from npm (needs Node.js >=18). The plugin prefers the patched engine when both are present and works with either; the extra tools and checks only exist with the patched one.
 
 ## Clone instead
 
 ```sh
 git clone https://github.com/RiklloD/hermes-plugin-computer-use-plus.git
 cd hermes-plugin-computer-use-plus
-python3 scripts/install-backend.py
+python3 scripts/build-engine.py
 hermes plugins install "file://$PWD" --no-enable
 hermes plugins enable computer-use-plus
 ```
 
-Local installs may link to this folder; keep it. The pinned upstream **open-computer-use 0.3.6** binary is fetched from npm with lockfile integrity, not checked into Git. The upstream source is public at [iFurySt/open-codex-computer-use](https://github.com/iFurySt/open-codex-computer-use). Set `HERMES_OCU_HOME` only if intentionally reusing an existing backend installation.
+Local installs may link to this folder; keep it. No engine binary is checked into Git: the patched engine is built locally from the pinned upstream source plus `engine/patches`. The upstream source is public at [iFurySt/open-computer-use](https://github.com/iFurySt/open-computer-use). Set `HERMES_OCU_HOME` only if intentionally reusing an existing backend installation.
 
 ## Safety and limitations
 

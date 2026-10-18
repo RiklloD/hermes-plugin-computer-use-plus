@@ -87,9 +87,11 @@ def tool(name, args, sid="t1"):
 
 # ── the model-facing surface is Open Computer Use's, verbatim ──
 
-def test_nine_codex_tools_with_verbatim_schemas():
-    assert codex.TOOL_NAMES == ("list_apps", "get_app_state", "click", "perform_secondary_action", "scroll", "drag",
-                                "type_text", "press_key", "set_value")
+def test_codex_tools_with_verbatim_schemas():
+    assert set(codex.TOOL_NAMES) == {"list_apps", "get_app_state", "query", "click", "perform_secondary_action",
+                                     "scroll", "drag", "type_text", "press_key", "set_value", "select_text"}
+    assert {"window_id", "window_title"} <= set(codex.schema("get_app_state")["parameters"]["properties"])
+    assert codex.schema("type_text")["parameters"]["properties"]["method"]["enum"] == ["auto", "keys", "paste"]
     click = codex.schema("click")
     assert click["description"].startswith("Click an element by index or pixel coordinates from screenshot.")
     assert click["parameters"]["required"] == ["app"]
@@ -272,6 +274,39 @@ def test_state_tells_the_viewer_the_window_and_labels(fake):
     s = live.snapshot()["sessions"][0]
     assert s["label"] == "Setting “text field” to “Bo”" and s["typing"]["window_id"] == 7
     assert s["status"] == "ok" and s["ok"] is True
+
+
+def test_a_tree_diff_keeps_the_labels_of_unchanged_elements(fake):
+    tool("get_app_state", {"app": "Notes"})
+    st = next(iter(codex._states.values()))
+    diff = textwrap.dedent("""\
+        App=com.apple.Notes (pid 5)
+        Window: "Untitled", App: Notes.
+        (tree diff: 1 added, 1 removed, 3 unchanged lines omitted; indexes on unchanged lines are still valid)
+        - 3 button Description: Delete
+        + 3 button Send Help: Send the message""")
+    codex._absorb(st, "t1", diff, None)
+    assert st.elements["1"] == "button Save" and st.elements["3"] == "button Send"
+
+
+def test_text_only_models_skip_state_screenshots_on_the_fork(fake, monkeypatch):
+    monkeypatch.setattr(ocu, "is_fork", lambda: True)
+    monkeypatch.setattr(codex, "_images_native", lambda: False)
+    live.configure(False)
+    tool("get_app_state", {"app": "Notes"})
+    assert fake.calls[-1][1]["include_screenshot"] is False
+    tool("get_app_state", {"app": "Notes", "include_screenshot": True})
+    assert fake.calls[-1][1]["include_screenshot"] is True
+    monkeypatch.setattr(codex, "_images_native", lambda: True)
+    tool("get_app_state", {"app": "Notes"})
+    assert "include_screenshot" not in fake.calls[-1][1]
+
+
+def test_fork_guidance_only_with_the_fork(monkeypatch):
+    monkeypatch.setattr(ocu, "is_fork", lambda: True)
+    assert "window_id" in codex.instructions() and 'method="paste"' in codex.instructions()
+    monkeypatch.setattr(ocu, "is_fork", lambda: False)
+    assert "Working fast and precisely" not in codex.instructions()
 
 
 def test_coordinate_click_places_the_cursor_from_screenshot_pixels(fake):

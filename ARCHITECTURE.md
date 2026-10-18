@@ -2,8 +2,8 @@
 
 Codex computer use for Hermes, plus a live screen share in Hermes Desktop.
 
-Since 0.5.0 the backend is [Open Computer Use](https://github.com/iFurySt/open-codex-computer-use) (`OpenComputerUse
-mcp`, installed with npm under `~/.hermes/tools/open-computer-use`). The model sees exactly what Codex's computer-use
+Since 0.5.0 the backend is [Open Computer Use](https://github.com/iFurySt/open-computer-use) (`OpenComputerUse
+mcp`); since 0.6.0 a patched build of it (engine/README.md, built by scripts/build-engine.py into engine/dist). The model sees exactly what Codex's computer-use
 plugin gives it:
 
 | Tool | What it does |
@@ -24,7 +24,7 @@ are the server's: the refreshed tree plus a screenshot (text only for models tha
 results). The native Codex-style cursor overlay is drawn on screen by Open Computer Use.app.
 
 How it plugs in:
-- The nine tools are registered in the `computer_use` toolset and counted as core for tool_search, so they are listed
+- The tools are registered in the `computer_use` toolset and counted as core for tool_search, so they are listed
   up front like Codex's instead of hiding behind `tool_search`.
 - With `plugins.entries.computer-use-plus.allow_tool_override: true` (and the `tools.override` grant), Hermes's
   cua-driver `computer_use` is overridden by a hidden stub, so the model has one way to drive apps. Without the grant
@@ -57,7 +57,7 @@ who holds the desktop.
 
 ## Files
 
-`__init__.py` registration · `codex.py` the nine tools · `ocu.py` stdio MCP client · `codex_tools.json` verbatim
+`__init__.py` registration · `codex.py` the tools · `ocu.py` stdio MCP client · `codex_tools.json` verbatim
 definitions · `windows.py` CGWindowList · `live.py` viewer state, Stop, Take over, capture · `stream.py` localhost
 server · `commands.py` `/computer-view` · `trace.py` one line per call in `logs/computer-use-plus.jsonl` (no content)
 · `desktop/plugin.js` viewer.

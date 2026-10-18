@@ -1,4 +1,4 @@
-"""The Codex computer-use tools for Hermes: Open Computer Use's nine native tools, exposed to the model verbatim
+"""The Codex computer-use tools for Hermes: Open Computer Use's native tools, exposed to the model verbatim
 (names, descriptions, input schemas, server instructions) and backed by `OpenComputerUse mcp`.
 
 Around each call the plugin adds only what Hermes needs: the human-takeover lease and the viewer's Stop are refused
@@ -29,7 +29,17 @@ TOOL_NAMES: Tuple[str, ...] = tuple(t["name"] for t in _DEFS["tools"])
 SERVER_INSTRUCTIONS: str = _DEFS["instructions"]
 
 _EMOJI = {"list_apps": "🗂️", "get_app_state": "👀", "click": "🖱️", "perform_secondary_action": "🧰", "scroll": "🖱️",
-          "drag": "✋", "type_text": "⌨️", "press_key": "⌨️", "set_value": "✏️"}
+          "drag": "✋", "type_text": "⌨️", "press_key": "⌨️", "set_value": "✏️", "query": "🔎", "select_text": "🔤"}
+
+# What the patched fork adds, said once in the system prompt rather than learnt by failing.
+FORK_GUIDANCE = """
+Working fast and precisely with these tools:
+- Find a control with `query` (text and/or role) instead of reading a whole tree when you know what you are looking for; its indexes work with click, set_value, scroll and perform_secondary_action.
+- Action results show only the tree lines that changed ("tree diff"); indexes on unchanged lines stay valid. A full tree comes back when the window changed or many lines moved.
+- Multi-window apps (mail compose, several browser windows): the `Windows:` header line lists window ids. Pin the one you are working in with get_app_state window_id (or window_title) so actions and results cannot drift to another window.
+- set_value and type_text read the field back. A set_value error or a type_text WARNING means nothing was written: do not assume success and do not retype blindly; check state first.
+- Long or multi-line text (email bodies): type_text method="paste". If type_text says no focused field was found, click the field first.
+- Before saving, sending or submitting, verify from the app itself (for mail: reopen the draft and check recipients, subject and body)."""
 
 
 def schema(name: str) -> Dict[str, Any]:
@@ -46,7 +56,8 @@ def instructions() -> str:
     text = SERVER_INSTRUCTIONS.replace(
         "Codex will automatically stop the session after each assistant turn",
         "Hermes ends the computer use session after each assistant turn")
-    return re.sub(r" If any of these are not available in your environment, use tool_search[^.]*\.", "", text)
+    text = re.sub(r" If any of these are not available in your environment, use tool_search[^.]*\.", "", text)
+    return text + "\n" + FORK_GUIDANCE if ocu.is_fork() else text
 
 
 # ── per-session state (element lines for viewer labels, screenshot sizes for coordinates) ──
@@ -89,7 +100,22 @@ def _state(key: str) -> _State:
 def _client(key: str, st: _State) -> ocu.Client:
     # Every OPEN_COMPUTER_USE_* variable is forwarded per request to the app agent that draws the cursor, so this
     # session's cursor positions land in its own file.
-    return ocu.client(key, {"OPEN_COMPUTER_USE_VISUAL_CURSOR_OBSERVATION_FILE": st.cursor_file})
+    env = {"OPEN_COMPUTER_USE_VISUAL_CURSOR_OBSERVATION_FILE": st.cursor_file}
+    if ocu.is_fork():
+        # Action results: changed tree lines only, and no screenshot capture/encoding for a model that never sees
+        # it (Hermes drops images for those models anyway).
+        env["OPEN_COMPUTER_USE_ACTION_RESULT"] = "diff"
+        env["OPEN_COMPUTER_USE_ACTION_SCREENSHOT"] = "1" if _images_native() else "0"
+    return ocu.client(key, env)
+
+
+def _prepare_args(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+    """A model that cannot see images gets no get_app_state screenshot unless it asks for one: capture and encoding
+    are the slowest part of a state read. Kept while the viewer is open, which uses it as its fallback picture."""
+    if (name == "get_app_state" and ocu.is_fork() and "include_screenshot" not in args
+            and not _images_native() and not live.active()):
+        return {**args, "include_screenshot": False}
+    return args
 
 
 def forget(session_id: str) -> None:
@@ -115,6 +141,8 @@ def turn_ended(session_id: str) -> None:
 _HEADER_APP = re.compile(r"^App=(\S+) \(pid (\d+)\)", re.M)
 _HEADER_WINDOW = re.compile(r'^Window: "(.*)", App: (.*?)\.$', re.M)
 _ELEMENT = re.compile(r"^\t*(\d+) (.+)$", re.M)
+_DIFF_MARK = re.compile(r"^\((?:tree diff:|no accessibility tree changes)", re.M)
+_DIFF_ADDED = re.compile(r"^\+ (\d+) (.+)$", re.M)
 _TRIM = re.compile(r"( ID: | Help: |, Secondary Actions: | Secondary Actions: | Description: ).*$")
 
 
@@ -140,7 +168,11 @@ def _absorb(st: _State, session_id: str, text: str, png: Optional[bytes]) -> Non
     st.bundle, st.pid = m.group(1), int(m.group(2))
     w = _HEADER_WINDOW.search(text)
     st.title, st.app = (w.group(1), w.group(2)) if w else ("", st.bundle)
-    st.elements = {i: _element_label(rest) for i, rest in _ELEMENT.findall(text)}
+    if _DIFF_MARK.search(text):
+        # A tree diff lists changed lines only: unchanged elements keep their labels.
+        st.elements.update({i: _element_label(rest) for i, rest in _DIFF_ADDED.findall(text)})
+    else:
+        st.elements = {i: _element_label(rest) for i, rest in _ELEMENT.findall(text)}
     size = _png_size(png) if png else None
     if size:
         st.shot_size = size
@@ -162,7 +194,7 @@ def _same_app(st: _State, app: Any) -> bool:
 # ── the viewer's cursor ──
 
 _POINTER_KIND = {"click": "click", "perform_secondary_action": "click", "scroll": "scroll", "drag": "drag",
-                 "set_value": "focus", "type_text": "focus", "press_key": "focus"}
+                 "set_value": "focus", "type_text": "focus", "press_key": "focus", "select_text": "focus"}
 
 
 def _click_kind(args: Dict[str, Any]) -> str:
@@ -353,7 +385,7 @@ def handle(name: str, args: Optional[Dict[str, Any]], **kwargs: Any) -> Any:
     started = time.monotonic()
     ok, code, out = False, None, None
     try:
-        result = _client(key, st).call(name, args, abort=_aborted(session_id))
+        result = _client(key, st).call(name, _prepare_args(name, args), abort=_aborted(session_id))
         out, text, png = _to_hermes(result)
         ok = not result.get("isError")
         if name != "list_apps":

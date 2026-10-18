@@ -1,7 +1,7 @@
 """Computer Use Plus: Codex computer use for Hermes, with a live screen share in Hermes Desktop.
 
-The model gets Open Computer Use's nine tools exactly as the MCP server defines them (`list_apps`, `get_app_state`,
-`click`, `perform_secondary_action`, `scroll`, `drag`, `type_text`, `press_key`, `set_value`), loaded eagerly like
+The model gets Open Computer Use's tools exactly as the MCP server defines them (`list_apps`, `get_app_state`, `query`,
+`click`, `perform_secondary_action`, `scroll`, `drag`, `type_text`, `press_key`, `set_value`, `select_text`), loaded eagerly like
 Codex's, plus the server's instructions in the system prompt. With the tools.override grant, Hermes's own cua-driver
 `computer_use` tool is hidden so the model has one way to drive apps. The screen share, Stop and Take over are the
 plugin's own (live.py, stream.py, desktop/plugin.js).
@@ -41,7 +41,7 @@ def contract_problems() -> list:
 
 def _keep_eager() -> None:
     """Codex lists its computer-use tools up front. Hermes defers plugin tools behind tool_search unless they are
-    core, so count these nine as core for deferral (only deferral: `_core_tool_names` feeds nothing else)."""
+    core, so count these as core for deferral (only deferral: `_core_tool_names` feeds nothing else)."""
     from tools import tool_search
     original = tool_search._core_tool_names
     if getattr(original, "_cup_eager", False):

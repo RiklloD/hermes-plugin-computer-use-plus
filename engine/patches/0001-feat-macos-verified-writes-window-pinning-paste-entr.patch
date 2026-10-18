@@ -1,0 +1,1052 @@
+From 0d82f77cd11d1d594fd293210a52376d3b52a684 Mon Sep 17 00:00:00 2001
+From: Lorik Dalloshi <lorik@Loriks-MacBook-Pro.local>
+Date: Sun, 18 Oct 2026 22:45:11 +0200
+Subject: [PATCH 1/2] feat(macos): verified writes, window pinning, paste entry
+ and diff read-back
+
+- set_value reads the value back and fails when the control ignored the
+  write (#83 finding 2). Text fields inside web content are filled with
+  real keystrokes so frameworks such as React register the edit; a native
+  text field that ignores the AX write is retried with keystrokes.
+- type_text resolves focus live instead of from the cached snapshot,
+  falls back to the field last clicked when macOS reports no focus for a
+  background app, verifies the field changed and returns a WARNING when it
+  did not. AX-write typing is confirmed by read-back before reporting
+  success. New method: auto | keys | paste (clipboard + Cmd+V, clipboard
+  restored).
+- get_app_state window_id / window_title pin a window: snapshots, actions
+  and read-backs stay on it (#83 finding 1). The header lists the app's
+  windows; an action whose read-back lands on another window says so.
+- OPEN_COMPUTER_USE_ACTION_RESULT=diff returns only changed tree lines
+  when the window is unchanged and few lines moved (#16, #83 finding 6a);
+  OPEN_COMPUTER_USE_ACTION_SCREENSHOT=0 skips read-back capture.
+- OPEN_COMPUTER_USE_APP_VARIANT=dev builds an optimized app with the Dev
+  bundle identity.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../AccessibilitySnapshot.swift               | 116 +++++-
+ .../ComputerUseService.swift                  | 332 ++++++++++++++++--
+ .../ComputerUseToolDispatcher.swift           |   7 +-
+ .../OpenComputerUseKit/InputSimulation.swift  |  31 ++
+ .../OpenComputerUseKit/TimingLog.swift        |   3 +
+ .../OpenComputerUseKit/ToolDefinitions.swift  |  10 +-
+ .../WriteVerification.swift                   | 165 +++++++++
+ .../WriteVerificationTests.swift              |  74 ++++
+ scripts/build-open-computer-use-app.sh        |   4 +-
+ 9 files changed, 685 insertions(+), 57 deletions(-)
+ create mode 100644 packages/OpenComputerUseKit/Sources/OpenComputerUseKit/WriteVerification.swift
+ create mode 100644 packages/OpenComputerUseKit/Tests/OpenComputerUseKitTests/WriteVerificationTests.swift
+
+diff --git a/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/AccessibilitySnapshot.swift b/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/AccessibilitySnapshot.swift
+index 2fbfc30..2c746d0 100644
+--- a/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/AccessibilitySnapshot.swift
++++ b/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/AccessibilitySnapshot.swift
+@@ -149,31 +149,49 @@ public struct AppSnapshot {
+     let elements: [Int: ElementRecord]
+     var screenshotNote: String? = nil
+     var observation: SnapshotObservationOptions = .defaults
++    /// The app's open windows as `id "title"` entries, listed only when there is
++    /// more than one, so the caller can pin one with get_app_state window_id.
++    var windowList: [String] = []
++    /// Set when a pinned window was requested but is gone.
++    var windowNote: String? = nil
+ 
+     public var renderedText: String {
+         renderedText(style: .fullState)
+     }
+ 
+-    public func renderedText(style: SnapshotTextStyle) -> String {
+-        var lines: [String] = []
++    var headerLines: [String] {
+         let displayTitle = displayWindowTitle(windowTitle, appName: app.name)
+         let appReference = app.bundleIdentifier ?? app.name
+-
+-        lines.append("App=\(appReference) (pid \(app.pid))")
+-        lines.append("Window: \(quoted(displayTitle)), App: \(app.name).")
+-        lines.append(contentsOf: treeLines)
+-        if !observation.includeAX {
+-            lines.append(SnapshotObservationOptions.accessibilityOmittedNote)
++        var lines = [
++            "App=\(appReference) (pid \(app.pid))",
++            "Window: \(quoted(displayTitle)), App: \(app.name).",
++        ]
++        if windowList.count > 1 {
++            lines.append("Windows: " + windowList.joined(separator: ", "))
++        }
++        if let windowNote {
++            lines.append(windowNote)
+         }
++        return lines
++    }
+ 
++    var footerLines: [String] {
+         if let selectedText, !selectedText.isEmpty {
+-            lines.append("")
+-            lines.append("Selected text: [\(selectedText)]")
++            return ["", "Selected text: [\(selectedText)]"]
+         } else if let focusedSummary {
+-            lines.append("")
+-            lines.append("The focused UI element is \(focusedSummary).")
++            return ["", "The focused UI element is \(focusedSummary)."]
++        }
++        return []
++    }
++
++    public func renderedText(style: SnapshotTextStyle) -> String {
++        var lines: [String] = headerLines
++        lines.append(contentsOf: treeLines)
++        if !observation.includeAX {
++            lines.append(SnapshotObservationOptions.accessibilityOmittedNote)
+         }
+ 
++        lines.append(contentsOf: footerLines)
+         return lines.joined(separator: "\n")
+     }
+ }
+@@ -189,7 +207,8 @@ enum SnapshotBuilder {
+         textLimit: SnapshotTextLimit = .defaults,
+         treeLimits: AccessibilityTreeLimits = .defaults,
+         recoveryPolicy: SnapshotRecoveryPolicy = .allowActivation,
+-        observation: SnapshotObservationOptions = .defaults
++        observation: SnapshotObservationOptions = .defaults,
++        pinnedWindowID: CGWindowID? = nil
+     ) throws -> AppSnapshot {
+         try observation.validate()
+         if app.name == FixtureBridge.appName, let fixtureState = try FixtureBridge.readState() {
+@@ -208,7 +227,21 @@ enum SnapshotBuilder {
+             || appHasLazyWebAccessibility(bundleURL: app.runningApplication.bundleURL))
+         let systemWide = AXUIElementCreateSystemWide()
+         var focusedApplication = copyElement(systemWide, attribute: kAXFocusedApplicationAttribute)
+-        var focusedWindow = preferredFocusedWindow(appElement: appElement, appPID: app.pid, focusedApplication: focusedApplication, systemWide: systemWide)
++        // A pinned window wins over whatever window has focus, so a snapshot and
++        // the actions and read-backs after it keep addressing the same window in
++        // multi-window apps.
++        var windowNote: String?
++        var focusedWindow: AXUIElement?
++        if let pinnedWindowID {
++            if let pinned = windowElement(for: pinnedWindowID, appElement: appElement), isUsableWindowElement(pinned) {
++                focusedWindow = pinned
++            } else {
++                windowNote = "Note: pinned window \(pinnedWindowID) is no longer open; showing the app's focused window instead. Element indexes now refer to this window."
++            }
++        }
++        if focusedWindow == nil {
++            focusedWindow = preferredFocusedWindow(appElement: appElement, appPID: app.pid, focusedApplication: focusedApplication, systemWide: systemWide)
++        }
+         if focusedWindow == nil,
+            recoveryPolicy == .allowActivation,
+            recoverVisibleWindow(for: app, appElement: appElement, preferredWindow: nil) {
+@@ -246,7 +279,7 @@ enum SnapshotBuilder {
+             throw ComputerUseError.stateUnavailable(computerUseNoWindowFoundMessage)
+         }
+ 
+-        return buildAccessibilitySnapshot(
++        var snapshot = buildAccessibilitySnapshot(
+             app: app,
+             appElement: appElement,
+             rootElement: rootWindow,
+@@ -259,6 +292,55 @@ enum SnapshotBuilder {
+             lazyWebAccessibility: lazyWebAccessibility,
+             observation: observation
+         )
++        snapshot.windowList = windowSummaries(appElement: appElement, currentWindowID: windowCapture.windowID)
++        snapshot.windowNote = windowNote
++        return snapshot
++    }
++
++    /// `id "title"` for each usable window, current one marked. At most 8, so a
++    /// browser with dozens of windows cannot flood the header.
++    private static func windowSummaries(appElement: AXUIElement, currentWindowID: CGWindowID?) -> [String] {
++        guard let windows = copyArray(appElement, attribute: kAXWindowsAttribute) else {
++            return []
++        }
++        var summaries: [String] = []
++        for window in windows where isUsableWindowElement(window) {
++            guard let id = SkyLightSPI.shared.windowID(for: window) else { continue }
++            let title = String((stringValue(of: window, attribute: kAXTitleAttribute) ?? "").prefix(60))
++            summaries.append("\(id) \(quoted(title))\(id == currentWindowID ? " (current)" : "")")
++            if summaries.count == 8 { break }
++        }
++        return summaries
++    }
++
++    /// The window whose title contains `title` (case-insensitive); an exact
++    /// match wins over a substring match.
++    static func windowID(matchingTitle title: String, for app: RunningAppDescriptor) -> CGWindowID? {
++        let appElement = AXUIElementCreateApplication(app.pid)
++        let needle = title.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
++        guard !needle.isEmpty, let windows = copyArray(appElement, attribute: kAXWindowsAttribute) else {
++            return nil
++        }
++        let candidates = windows.filter(isUsableWindowElement(_:)).compactMap { window -> (CGWindowID, String)? in
++            guard let id = SkyLightSPI.shared.windowID(for: window) else { return nil }
++            return (id, (stringValue(of: window, attribute: kAXTitleAttribute) ?? "").lowercased())
++        }
++        return (candidates.first { $0.1 == needle } ?? candidates.first { $0.1.contains(needle) })?.0
++    }
++
++    static func windowExists(_ windowID: CGWindowID, for app: RunningAppDescriptor) -> Bool {
++        windowElement(for: windowID, appElement: AXUIElementCreateApplication(app.pid)) != nil
++    }
++
++    /// The element that has keyboard focus right now, read live rather than from
++    /// a cached snapshot.
++    static func liveFocusedElement(for app: RunningAppDescriptor) -> AXUIElement? {
++        let appElement = AXUIElementCreateApplication(app.pid)
++        AXUIElementSetMessagingTimeout(appElement, 0.25)
++        let systemWide = AXUIElementCreateSystemWide()
++        AXUIElementSetMessagingTimeout(systemWide, 0.25)
++        let focusedApplication = copyElement(systemWide, attribute: kAXFocusedApplicationAttribute)
++        return preferredFocusedElement(appElement: appElement, appPID: app.pid, focusedApplication: focusedApplication, systemWide: systemWide)
+     }
+ 
+     private static func buildAccessibilitySnapshot(
+@@ -2284,7 +2366,7 @@ private func displayIdentifier(_ value: String?) -> String? {
+     return value
+ }
+ 
+-private func displayWindowTitle(_ value: String?, appName: String) -> String {
++func displayWindowTitle(_ value: String?, appName: String) -> String {
+     guard let value, !value.isEmpty else {
+         return appName
+     }
+@@ -2296,7 +2378,7 @@ private func displayWindowTitle(_ value: String?, appName: String) -> String {
+     return value
+ }
+ 
+-private func quoted(_ value: String) -> String {
++func quoted(_ value: String) -> String {
+     "\"\(value)\""
+ }
+ 
+diff --git a/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/ComputerUseService.swift b/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/ComputerUseService.swift
+index a74e823..a6e8757 100644
+--- a/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/ComputerUseService.swift
++++ b/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/ComputerUseService.swift
+@@ -560,6 +560,13 @@ public final class ComputerUseService {
+ 
+     public func clearQueryIndexes() { targetedElements.clear() }
+ 
++    /// Windows pinned by get_app_state window_id / window_title, per app process.
++    /// Snapshots, actions and read-backs for that app stay on the pinned window.
++    private var pinnedWindowByPID: [pid_t: CGWindowID] = [:]
++    /// The text control the caller last clicked or set, per app process: the
++    /// type_text target when macOS reports no focus (background apps).
++    private var rememberedTextTargetByPID: [pid_t: AXUIElement] = [:]
++
+     public init() {}
+ 
+     /// An action's result reads the window back, so the app gets a beat to redraw
+@@ -574,12 +581,45 @@ public final class ComputerUseService {
+ 
+     /// The result an action returns: the after-action snapshot, or a short status
+     /// when read-back is off.
+-    private func actionResult(for query: String, recoveryPolicy: SnapshotRecoveryPolicy = .allowActivation) throws -> ToolCallResult {
++    private func actionResult(
++        for query: String,
++        recoveryPolicy: SnapshotRecoveryPolicy = .allowActivation,
++        notes: [String] = []
++    ) throws -> ToolCallResult {
+         guard actionReadBack else {
+-            return .text("ok")
++            return .text((["ok"] + notes).joined(separator: "\n"))
+         }
+ 
+-        return snapshotResult(for: try refreshSnapshot(for: query, recoveryPolicy: recoveryPolicy), style: .actionResult)
++        let environment = ProcessInfo.processInfo.environment
++        let previous = snapshotsByApp[query.lowercased()]
++        let observation = SnapshotObservationOptions(includeAX: true, includeScreenshot: actionScreenshotEnabled(environment: environment))
++        let snapshot = try refreshSnapshot(for: query, recoveryPolicy: recoveryPolicy, observation: observation)
++
++        var lines = snapshot.headerLines
++        var windowChanged = false
++        if let previous, previous.mode == .accessibility, previous.targetWindowID != snapshot.targetWindowID {
++            windowChanged = true
++            lines.append("Note: the target window changed from \(quoted(displayWindowTitle(previous.windowTitle, appName: previous.app.name))) to this one; element indexes from earlier states no longer apply. Pin a window with get_app_state window_id to keep addressing it.")
++        }
++        if !windowChanged,
++           actionResultMode(environment: environment) == .diff,
++           let previous, previous.mode == .accessibility, previous.observation.includeAX,
++           let diff = treeDiffLines(previous: previous.treeLines, current: snapshot.treeLines) {
++            lines.append(contentsOf: diff)
++        } else {
++            lines.append(contentsOf: snapshot.treeLines)
++        }
++        lines.append(contentsOf: snapshot.footerLines)
++        if !notes.isEmpty {
++            lines.append("")
++            lines.append(contentsOf: notes)
++        }
++
++        var content = [ToolResultContentItem.text(lines.joined(separator: "\n"))]
++        if let screenshotData = snapshot.screenshotData {
++            content.append(.screenshotImage(screenshotData))
++        }
++        return ToolCallResult(content: content)
+     }
+ 
+     public func listApps() -> ToolCallResult {
+@@ -595,9 +635,12 @@ public final class ComputerUseService {
+         textLimit: SnapshotTextLimit = .defaults,
+         treeLimits: AccessibilityTreeLimits = .defaults,
+         windowPlacement: WindowPlacement = .keep,
+-        observation: SnapshotObservationOptions = .defaults
++        observation: SnapshotObservationOptions = .defaults,
++        windowID: CGWindowID? = nil,
++        windowTitle: String? = nil
+     ) throws -> ToolCallResult {
+         try observation.validate()
++        try updateWindowPin(app: query, windowID: windowID, windowTitle: windowTitle)
+         guard windowPlacement != .keep else {
+             return snapshotResult(for: try refreshSnapshot(for: query, textLimit: textLimit, treeLimits: treeLimits, observation: observation), style: .fullState)
+         }
+@@ -740,6 +783,7 @@ public final class ComputerUseService {
+                 throw error
+             }
+ 
++            rememberTextTarget(record.element, pid: snapshot.app.pid)
+             pulseVisualCursor(at: cursorTarget, clickCount: clickCount, mouseButton: button)
+         } else if let x, let y {
+             let screenshotPoint = CGPoint(x: x, y: y)
+@@ -800,6 +844,7 @@ public final class ComputerUseService {
+                 throw error
+             }
+ 
++            rememberTextTarget(((try? hitTestElement(at: screenshotPoint, in: snapshot)) ?? nil)?.element, pid: snapshot.app.pid)
+             pulseVisualCursor(at: cursorTarget, clickCount: clickCount, mouseButton: button)
+         } else {
+             throw ComputerUseError.invalidArguments("click requires either element_index or x/y")
+@@ -907,35 +952,176 @@ public final class ComputerUseService {
+         )
+     }
+ 
+-    public func typeText(app query: String, text: String, keyMethod: KeyMethod = .auto) throws -> ToolCallResult {
++    public func typeText(
++        app query: String,
++        text: String,
++        keyMethod: KeyMethod = .auto,
++        method: TextEntryMethod = .auto
++    ) throws -> ToolCallResult {
+         let snapshot = try currentSnapshot(for: query)
+         if snapshot.mode == .fixture {
+             try requireAutoKeyMethodForFixture(keyMethod)
++            guard method == .auto else {
++                throw ComputerUseError.message("method '\(method.rawValue)' is not supported for fixture apps")
++            }
+             try FixtureBridge.post(FixtureCommand(kind: "type_text", identifier: "fixture-input", value: text))
+             Thread.sleep(forTimeInterval: 0.15)
+             return try actionResult(for: query)
+         }
+ 
++        let pid = snapshot.app.pid
++        let recoveryPolicy = keyActionSnapshotRecoveryPolicy(for: keyMethod)
++        // Focus is read now, not from the cached snapshot: the snapshot predates
++        // the click that focused the field. macOS reports no focus for many
++        // background apps, so fall back to the field the caller last clicked.
++        let target = textEntryElement(SnapshotBuilder.liveFocusedElement(for: snapshot.app))
++            ?? rememberedTextTarget(pid: pid)
++        let before = target.flatMap(readableValue(of:))
++
++        if method == .auto, keyMethod == .auto, let target, !isInsideWebArea(target),
++           try typeTextBySettingValue(text, on: target, before: before) {
++            return try actionResult(for: query)
++        }
++
++        if method == .auto, target == nil, keyMethod == .auto {
++            throw ComputerUseError.stateUnavailable(
++                "type_text found no focused text field in \(snapshot.app.name) (macOS often reports no focus for background apps). "
++                    + "Click the field first, then type_text again; or pass method=\"keys\" to type into whatever has keyboard focus, "
++                    + "or key_method=\"sky_key\" to target the window directly."
++            )
++        }
++
++        if let target, method != .keys {
++            focusTextTarget(target)
++        }
++        switch method {
++        case .paste:
++            try InputSimulation.pasteText(text) {
++                try deliverKey("cmd+v", keyMethod: keyMethod, snapshot: snapshot)
++            }
++        case .auto, .keys:
++            if keyMethod == .skyKey {
++                let skyTarget = try skyKeyTarget(for: snapshot)
++                try InputSimulation.typeTextWithSkyLight(text, windowID: skyTarget.windowID, pid: skyTarget.pid)
++            } else {
++                try InputSimulation.typeText(text, pid: pid)
++            }
++        }
++
++        var notes: [String] = []
++        if let target {
++            switch awaitWrite(on: target, timeout: 0.5, classify: { classifyTextInsertion(typed: text, before: before, after: $0) }) {
++            case .confirmed, .unreadable:
++                break
++            case let .differs(value):
++                notes.append("Note: the field now reads \(quoted(truncatedForMessage(value))), which does not end with the typed text (the app may format or autocomplete input).")
++            case .unchanged:
++                notes.append("WARNING: the text field's value did not change after typing, so the keystrokes probably went to another element. Do not retype blindly: call get_app_state to see where focus is, click the field, then type again.")
++            }
++        }
++        return try actionResult(for: query, recoveryPolicy: recoveryPolicy, notes: notes)
++    }
++
++    private func deliverKey(_ key: String, keyMethod: KeyMethod, snapshot: AppSnapshot) throws {
+         if keyMethod == .skyKey {
+             let target = try skyKeyTarget(for: snapshot)
+-            try InputSimulation.typeTextWithSkyLight(text, windowID: target.windowID, pid: target.pid)
+-            return snapshotResult(
+-                for: try refreshSnapshot(for: query, recoveryPolicy: keyActionSnapshotRecoveryPolicy(for: keyMethod)),
+-                style: .actionResult
+-            )
++            try InputSimulation.pressKeyWithSkyLight(key, windowID: target.windowID, pid: target.pid)
++        } else {
++            try InputSimulation.pressKey(key, pid: snapshot.app.pid)
+         }
++    }
+ 
+-        if try typeTextBySettingFocusedValueIfAvailable(text, in: snapshot) {
+-            pauseBeforeReadBack(0.1)
+-            return try actionResult(for: query)
++    /// AX-write `text` after the field's current text and confirm it by reading
++    /// back. False when the app refuses or silently ignores the write, so the
++    /// caller falls back to keystrokes instead of reporting a write that never
++    /// happened.
++    private func typeTextBySettingValue(_ text: String, on element: AXUIElement, before: String?) throws -> Bool {
++        guard try isSettableForSetValue(element: element, attribute: kAXValueAttribute) else {
++            return false
++        }
++        let requested = editableBaseValue(for: element) + text
++        try requireUsableComputerUseSession()
++        switch AXUIElementSetAttributeValue(element, kAXValueAttribute as CFString, requested as CFString) {
++        case .success:
++            break
++        case .failure, .attributeUnsupported, .actionUnsupported, .cannotComplete, .noValue, .invalidUIElement, .illegalArgument:
++            return false
++        case let other:
++            throw ComputerUseError.message("AXUIElementSetAttributeValue failed with \(other.rawValue)")
+         }
++        return awaitWrite(on: element, classify: { classifyValueWrite(requested: requested, before: before, after: $0) }) == .confirmed
++    }
+ 
+-        guard try canTypeTextUsingKeyboardFallback(in: snapshot) else {
+-            throw ComputerUseError.stateUnavailable("type_text requires a focused editable text element. Click a text entry area first, or use set_value on a settable text element.")
++    /// The text control `element` is or sits in (hit tests often land on the
++    /// static text inside a field), or nil when it is not a text control.
++    private func textEntryElement(_ element: AXUIElement?) -> AXUIElement? {
++        var current = element
++        for _ in 0..<4 {
++            guard let candidate = current else { return nil }
++            if isTextEntry(candidate) { return candidate }
++            current = copyParent(of: candidate)
+         }
++        return nil
++    }
+ 
+-        try InputSimulation.typeText(text, pid: snapshot.app.pid)
+-        return try actionResult(for: query)
++    private func isTextEntry(_ element: AXUIElement) -> Bool {
++        let role = stringValue(of: element, attribute: kAXRoleAttribute)
++        if role == kAXTextFieldRole as String || role == "AXTextArea" || role == "AXTextView" || role == kAXComboBoxRole as String
++            || role == "AXSearchField" {
++            return true
++        }
++        let roleDescription = stringValue(of: element, attribute: kAXRoleDescriptionAttribute)?.lowercased() ?? ""
++        if roleDescription.contains("text field") || roleDescription.contains("text area") || roleDescription.contains("text entry") {
++            return true
++        }
++        // contenteditable regions in web content.
++        return boolValue(of: element, attribute: "AXEditable") == true
++    }
++
++    private func rememberTextTarget(_ element: AXUIElement?, pid: pid_t) {
++        if let target = textEntryElement(element) {
++            rememberedTextTargetByPID[pid] = target
++        } else {
++            rememberedTextTargetByPID.removeValue(forKey: pid)
++        }
++    }
++
++    private func rememberedTextTarget(pid: pid_t) -> AXUIElement? {
++        guard let element = rememberedTextTargetByPID[pid] else { return nil }
++        // A destroyed element no longer answers for its role.
++        guard stringValue(of: element, attribute: kAXRoleAttribute) != nil else {
++            rememberedTextTargetByPID.removeValue(forKey: pid)
++            return nil
++        }
++        return element
++    }
++
++    /// Give `element` keyboard focus through accessibility. Best effort: when an
++    /// app refuses, the keystrokes still go to its existing focus.
++    private func focusTextTarget(_ element: AXUIElement) {
++        if boolValue(of: element, attribute: kAXFocusedAttribute) == true { return }
++        if AXUIElementSetAttributeValue(element, kAXFocusedAttribute as CFString, kCFBooleanTrue) == .success {
++            Thread.sleep(forTimeInterval: 0.05)
++        }
++    }
++
++    private func isInsideWebArea(_ element: AXUIElement) -> Bool {
++        var current = element
++        for _ in 0..<64 {
++            guard let parent = copyParent(of: current) else { return false }
++            if stringValue(of: parent, attribute: kAXRoleAttribute) == "AXWebArea" { return true }
++            current = parent
++        }
++        return false
++    }
++
++    private func boolValue(of element: AXUIElement, attribute: String) -> Bool? {
++        var raw: CFTypeRef?
++        guard AXUIElementCopyAttributeValue(element, attribute as CFString, &raw) == .success,
++              let raw, CFGetTypeID(raw) == CFBooleanGetTypeID() else {
++            return nil
++        }
++        return CFBooleanGetValue((raw as! CFBoolean))
+     }
+ 
+     public func pressKey(app query: String, key: String, keyMethod: KeyMethod = .auto) throws -> ToolCallResult {
+@@ -947,17 +1133,8 @@ public final class ComputerUseService {
+             return try actionResult(for: query)
+         }
+ 
+-        if keyMethod == .skyKey {
+-            let target = try skyKeyTarget(for: snapshot)
+-            try InputSimulation.pressKeyWithSkyLight(key, windowID: target.windowID, pid: target.pid)
+-            return snapshotResult(
+-                for: try refreshSnapshot(for: query, recoveryPolicy: keyActionSnapshotRecoveryPolicy(for: keyMethod)),
+-                style: .actionResult
+-            )
+-        }
+-
+-        try InputSimulation.pressKey(key, pid: snapshot.app.pid)
+-        return try actionResult(for: query)
++        try deliverKey(key, keyMethod: keyMethod, snapshot: snapshot)
++        return try actionResult(for: query, recoveryPolicy: keyActionSnapshotRecoveryPolicy(for: keyMethod))
+     }
+ 
+     private func requireAutoKeyMethodForFixture(_ keyMethod: KeyMethod) throws {
+@@ -1006,21 +1183,76 @@ public final class ComputerUseService {
+         let cursorTarget = visualCursorTarget(for: record, snapshot: snapshot)
+         moveVisualCursor(to: cursorTarget)
+ 
++        let before = readableValue(of: element)
++        let classify = { (after: String?) in classifyValueWrite(requested: value, before: before, after: after) }
++        // Web frameworks (React and friends) keep their own copy of a field's
++        // text and only learn about edits from input events: a raw AX write
++        // shows in the field and is then lost (an empty subject on a saved
++        // draft). Web text fields get real keystrokes instead.
++        let isWebText = isTextEntry(element) && isInsideWebArea(element)
++        var check: WriteCheck
++        var path = isWebText ? "keystrokes" : "accessibility"
+         do {
+             try requireUsableComputerUseSession()
+-            let result = AXUIElementSetAttributeValue(element, kAXValueAttribute as CFString, value as CFString)
+-            guard result == .success else {
+-                throw ComputerUseError.message("AXUIElementSetAttributeValue failed with \(result.rawValue)")
++            if isWebText {
++                try replaceTextWithKeystrokes(in: element, with: value, pid: snapshot.app.pid, currentValue: before)
++                check = awaitWrite(on: element, timeout: 0.6, classify: classify)
++            } else {
++                let result = AXUIElementSetAttributeValue(element, kAXValueAttribute as CFString, value as CFString)
++                guard result == .success else {
++                    throw ComputerUseError.message("AXUIElementSetAttributeValue failed with \(result.rawValue)")
++                }
++                check = awaitWrite(on: element, classify: classify)
++                // Accepted but ignored: retry the way a person would, if this
++                // is a text control.
++                if case .unchanged = check, isTextEntry(element) {
++                    path = "keystrokes (accessibility write was ignored)"
++                    try replaceTextWithKeystrokes(in: element, with: value, pid: snapshot.app.pid, currentValue: before)
++                    check = awaitWrite(on: element, timeout: 0.6, classify: classify)
++                }
+             }
+-
+-            pauseBeforeReadBack(0.1)
+         } catch {
+             settleVisualCursor(at: cursorTarget)
+             throw error
+         }
+ 
+         settleVisualCursor(at: cursorTarget)
+-        return try actionResult(for: query)
++        rememberTextTarget(element, pid: snapshot.app.pid)
++        var notes: [String] = []
++        switch check {
++        case .confirmed:
++            if path != "accessibility" { notes.append("set_value delivered via \(path); value confirmed.") }
++        case let .differs(actual):
++            notes.append("Note: element \(elementIndex) now reads \(quoted(truncatedForMessage(actual))) rather than exactly the requested value (via \(path)).")
++        case .unreadable:
++            notes.append("Note: element \(elementIndex)'s value cannot be read back, so this write is unconfirmed (via \(path)).")
++        case let .unchanged(actual):
++            throw ComputerUseError.message(
++                "set_value had no effect: element \(elementIndex) still reads \(quoted(truncatedForMessage(actual))) after the write (via \(path)). "
++                    + "The app ignores programmatic writes to this control. Click it and use type_text, or use its own UI (pickers, menus)."
++            )
++        }
++        return try actionResult(for: query, notes: notes)
++    }
++
++    /// Replace a text control's contents the way a person does: focus it, select
++    /// everything, type. Typing over a selection replaces it; an empty value
++    /// deletes it.
++    private func replaceTextWithKeystrokes(in element: AXUIElement, with value: String, pid: pid_t, currentValue: String?) throws {
++        focusTextTarget(element)
++        let length = (currentValue ?? "").utf16.count
++        var range = CFRange(location: 0, length: length)
++        let selectedAll = length == 0 || AXValueCreate(.cfRange, &range).map {
++            AXUIElementSetAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, $0) == .success
++        } == true
++        if !selectedAll {
++            try InputSimulation.pressKey("cmd+a", pid: pid)
++        }
++        if value.isEmpty {
++            if length > 0 { try InputSimulation.pressKey("delete", pid: pid) }
++        } else {
++            try InputSimulation.typeText(value, pid: pid)
++        }
+     }
+ 
+     public func selectText(
+@@ -1222,18 +1454,48 @@ public final class ComputerUseService {
+         observation: SnapshotObservationOptions = .defaults
+     ) throws -> AppSnapshot {
+         let app = try AppDiscovery.resolve(query)
++        let pinned = pinnedWindowByPID[app.pid]
+         let snapshot = try SnapshotBuilder.build(
+             for: app,
+             textLimit: textLimit,
+             treeLimits: treeLimits,
+             recoveryPolicy: recoveryPolicy,
+-            observation: observation
++            observation: observation,
++            pinnedWindowID: pinned
+         )
++        if pinned != nil, snapshot.targetWindowID != pinned {
++            pinnedWindowByPID.removeValue(forKey: app.pid)
++        }
+ 
+         rememberSnapshot(snapshot, for: query)
+         return snapshot
+     }
+ 
++    /// get_app_state with window_id or window_title pins that window; without
++    /// either it unpins, so the snapshot follows the app's focused window again.
++    private func updateWindowPin(app query: String, windowID: CGWindowID?, windowTitle: String?) throws {
++        let title = windowTitle?.trimmingCharacters(in: .whitespacesAndNewlines)
++        guard let app = try? AppDiscovery.resolveRunning(query) else {
++            if windowID != nil || !(title ?? "").isEmpty {
++                throw ComputerUseError.stateUnavailable("window_id / window_title need a running app; \(query) is not running")
++            }
++            return
++        }
++        if let windowID {
++            guard SnapshotBuilder.windowExists(windowID, for: app) else {
++                throw ComputerUseError.invalidArguments("window_id \(windowID) is not an open window of \(app.name). Call get_app_state without it to list the app's windows.")
++            }
++            pinnedWindowByPID[app.pid] = windowID
++        } else if let title, !title.isEmpty {
++            guard let match = SnapshotBuilder.windowID(matchingTitle: title, for: app) else {
++                throw ComputerUseError.invalidArguments("no window of \(app.name) has a title containing \(quoted(title)). Call get_app_state without window_title to list the app's windows.")
++            }
++            pinnedWindowByPID[app.pid] = match
++        } else {
++            pinnedWindowByPID.removeValue(forKey: app.pid)
++        }
++    }
++
+     func rememberSnapshot(_ snapshot: AppSnapshot, for query: String) {
+         let app = snapshot.app
+         if !snapshot.observation.includeAX {
+diff --git a/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/ComputerUseToolDispatcher.swift b/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/ComputerUseToolDispatcher.swift
+index cfa984c..fb586a4 100644
+--- a/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/ComputerUseToolDispatcher.swift
++++ b/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/ComputerUseToolDispatcher.swift
+@@ -71,7 +71,9 @@ public final class ComputerUseToolDispatcher {
+                 observation: SnapshotObservationOptions(
+                     includeAX: try strictObservationBool("include_ax", in: arguments),
+                     includeScreenshot: try strictObservationBool("include_screenshot", in: arguments)
+-                )
++                ),
++                windowID: try validatedQueryWindowID(arguments["window_id"]),
++                windowTitle: optionalString("window_title", in: arguments)
+             )
+         case "click":
+             return try service.click(
+@@ -108,7 +110,8 @@ public final class ComputerUseToolDispatcher {
+             return try service.typeText(
+                 app: requireString("app", in: arguments),
+                 text: requireString("text", in: arguments),
+-                keyMethod: try parseKeyMethod(optionalString("key_method", in: arguments))
++                keyMethod: try parseKeyMethod(optionalString("key_method", in: arguments)),
++                method: try parseTextEntryMethod(optionalString("method", in: arguments))
+             )
+         case "press_key":
+             return try service.pressKey(
+diff --git a/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/InputSimulation.swift b/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/InputSimulation.swift
+index fa0e30d..b83ad2a 100644
+--- a/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/InputSimulation.swift
++++ b/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/InputSimulation.swift
+@@ -206,6 +206,37 @@ enum InputSimulation {
+         }
+     }
+ 
++    /// Put `text` on the clipboard, send Cmd+V through `deliverPaste`, then put
++    /// the previous clipboard back unless something else replaced it meanwhile.
++    static func pasteText(_ text: String, deliverPaste: () throws -> Void) throws {
++        try requireUsableComputerUseSession()
++        let pasteboard = NSPasteboard.general
++        let saved: [NSPasteboardItem] = (pasteboard.pasteboardItems ?? []).map { item in
++            let copy = NSPasteboardItem()
++            for type in item.types {
++                if let data = item.data(forType: type) {
++                    copy.setData(data, forType: type)
++                }
++            }
++            return copy
++        }
++
++        pasteboard.clearContents()
++        pasteboard.setString(text, forType: .string)
++        let ourChangeCount = pasteboard.changeCount
++        defer {
++            // The target reads the clipboard while handling Cmd+V, asynchronously.
++            Thread.sleep(forTimeInterval: InputTiming.pasteRestoreDelay)
++            if pasteboard.changeCount == ourChangeCount {
++                pasteboard.clearContents()
++                if !saved.isEmpty {
++                    pasteboard.writeObjects(saved)
++                }
++            }
++        }
++        try deliverPaste()
++    }
++
+     static func keyboardUnicodeChunks(for text: String, maxUTF16Units: Int = maxKeyboardUnicodeChunkLength) -> [[UniChar]] {
+         precondition(maxUTF16Units > 0, "maxUTF16Units must be positive")
+ 
+diff --git a/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/TimingLog.swift b/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/TimingLog.swift
+index 34e49ac..383a749 100644
+--- a/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/TimingLog.swift
++++ b/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/TimingLog.swift
+@@ -61,6 +61,9 @@ enum InputTiming {
+         "OPEN_COMPUTER_USE_TYPE_CHUNK_DELAY_MS",
+         default: typeChunkDelayDefaultMilliseconds
+     )
++    /// How long type_text method=paste leaves the text on the clipboard before
++    /// restoring the previous contents.
++    static let pasteRestoreDelay = milliseconds("OPEN_COMPUTER_USE_PASTE_RESTORE_MS", default: 250)
+     /// Gap after a press_key chord. Keep the established default because the
+     /// target may process its event queue asynchronously.
+     static let pressKeySettle = milliseconds(
+diff --git a/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/ToolDefinitions.swift b/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/ToolDefinitions.swift
+index d6c0fd3..1eb663c 100644
+--- a/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/ToolDefinitions.swift
++++ b/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/ToolDefinitions.swift
+@@ -100,6 +100,8 @@ public enum ToolDefinitions {
+                     "text_limit": textLimitProperty(description: "Maximum text characters to return. Use \"max\" for full text. Defaults to 500."),
+                     "max_tree_nodes": positiveIntegerProperty(description: "Maximum accessibility tree nodes to render. Defaults to 1200."),
+                     "max_tree_depth": positiveIntegerProperty(description: "Maximum accessibility tree depth to render. Defaults to 64."),
++                    "window_id": positiveIntegerProperty(description: "Pin this window (an id from the `Windows:` header line). Later actions and their results stay on it until get_app_state is called without window_id/window_title or the window closes. Use in multi-window apps (mail compose windows, browser windows)."),
++                    "window_title": stringProperty(description: "Pin the window whose title contains this text (case-insensitive); same pinning as window_id."),
+                     "window_placement": stringProperty(
+                         description: "keep (default) leaves the window where it is. agent_display (macOS) parks the app's window on an invisible display owned by the agent so a covered or other-Space window renders, exposes its full tree and accepts input without touching the user's Space, focus or pointer; the window disappears from the user's desktop until restore or process exit. restore puts it back.",
+                         enumValues: WindowPlacement.allCases.map(\.rawValue)
+@@ -156,7 +158,7 @@ public enum ToolDefinitions {
+         ),
+         ToolDefinition(
+             name: "set_value",
+-            description: "Set the value of a settable accessibility element. This tool is part of plugin `Computer Use`.",
++            description: "Set the value of a settable accessibility element. The value is read back: the call fails if the control ignored the write. Text fields in web content are filled with real keystrokes so web apps register the edit. This tool is part of plugin `Computer Use`.",
+             annotations: defaultAnnotations(),
+             inputSchema: objectSchema(
+                 properties: [
+@@ -188,12 +190,16 @@ public enum ToolDefinitions {
+         ),
+         ToolDefinition(
+             name: "type_text",
+-            description: "Type literal text using keyboard input. This tool is part of plugin `Computer Use`.",
++            description: "Type literal text into the focused text field (or the field last clicked, when the app is in the background). The field is read back afterwards and a WARNING is returned if its value did not change. This tool is part of plugin `Computer Use`.",
+             annotations: defaultAnnotations(),
+             inputSchema: objectSchema(
+                 properties: [
+                     "app": stringProperty(description: "App name or bundle identifier"),
+                     "text": stringProperty(description: "Literal text to type"),
++                    "method": stringProperty(
++                        description: "auto (default): accessibility write for native fields, keystrokes for web content, both verified. paste: clipboard + Cmd+V in one step, best for long or multi-line text such as email bodies; the previous clipboard is restored. keys: keystrokes to the app's current keyboard focus even when no focused field is visible to accessibility.",
++                        enumValues: TextEntryMethod.allCases.map(\.rawValue)
++                    ),
+                     "key_method": keyMethodProperty(),
+                 ],
+                 required: ["app", "text"]
+diff --git a/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/WriteVerification.swift b/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/WriteVerification.swift
+new file mode 100644
+index 0000000..7cb6683
+--- /dev/null
++++ b/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/WriteVerification.swift
+@@ -0,0 +1,165 @@
++import ApplicationServices
++import Foundation
++
++/// How text gets into an app for type_text.
++public enum TextEntryMethod: String, CaseIterable, Sendable {
++    /// Accessibility write for native fields, keystrokes for web content, each
++    /// confirmed by reading the field back.
++    case auto
++    /// Keystrokes to the app's current keyboard focus, without requiring the
++    /// focused element to be visible to accessibility.
++    case keys
++    /// Clipboard + Cmd+V, restoring the previous clipboard afterwards. One event
++    /// for any length of text.
++    case paste
++}
++
++func parseTextEntryMethod(_ rawValue: String?) throws -> TextEntryMethod {
++    let normalized = rawValue?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? TextEntryMethod.auto.rawValue
++    guard let method = TextEntryMethod(rawValue: normalized.isEmpty ? TextEntryMethod.auto.rawValue : normalized) else {
++        throw ComputerUseError.invalidArguments("method must be one of: \(TextEntryMethod.allCases.map(\.rawValue).joined(separator: ", "))")
++    }
++    return method
++}
++
++/// What reading a field back after a write says about the write.
++enum WriteCheck: Equatable {
++    /// The field now holds what was written.
++    case confirmed
++    /// The field changed, but not to exactly what was written (formatting,
++    /// masking, autocompletion).
++    case differs(String)
++    /// The field still holds its previous value: the write did nothing.
++    case unchanged(String)
++    /// The field's value is not readable, so the write cannot be confirmed.
++    case unreadable
++}
++
++/// The element's value as text, whatever CF type the app reports it as.
++func readableValue(of element: AXUIElement) -> String? {
++    var raw: CFTypeRef?
++    guard AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &raw) == .success, let raw else {
++        return nil
++    }
++    if let string = raw as? String { return string }
++    if let attributed = raw as? NSAttributedString { return attributed.string }
++    if CFGetTypeID(raw) == CFBooleanGetTypeID() { return CFBooleanGetValue((raw as! CFBoolean)) ? "1" : "0" }
++    if let number = raw as? NSNumber { return number.stringValue }
++    return nil
++}
++
++/// Whitespace-insensitive form used for comparisons: zero-width characters
++/// dropped, non-breaking spaces and runs of whitespace collapsed.
++func comparableText(_ text: String) -> String {
++    let dropped = text.unicodeScalars.filter { !["\u{200B}", "\u{200C}", "\u{200D}", "\u{FEFF}"].contains($0) }
++    let cleaned = String(String.UnicodeScalarView(dropped)).replacingOccurrences(of: "\u{00A0}", with: " ")
++    return cleaned.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
++}
++
++private func numericValue(_ text: String) -> Double? {
++    Double(text.replacingOccurrences(of: ",", with: "").replacingOccurrences(of: "'", with: ""))
++}
++
++/// Classify a value replacement (set_value).
++func classifyValueWrite(requested: String, before: String?, after: String?) -> WriteCheck {
++    guard let after else { return .unreadable }
++    let wanted = comparableText(requested)
++    let now = comparableText(after)
++    if now == wanted { return .confirmed }
++    if let before, comparableText(before) == now { return .unchanged(after) }
++    if !wanted.isEmpty, now.contains(wanted) { return .confirmed }
++    if let a = numericValue(now), let b = numericValue(wanted), a == b { return .confirmed }
++    return .differs(after)
++}
++
++/// Classify an insertion (type_text): the field must have changed and should
++/// now contain the end of the typed text.
++func classifyTextInsertion(typed: String, before: String?, after: String?) -> WriteCheck {
++    guard let after else { return .unreadable }
++    let now = comparableText(after)
++    if let before, comparableText(before) == now {
++        return comparableText(typed).isEmpty ? .confirmed : .unchanged(after)
++    }
++    let tail = String(comparableText(typed).suffix(40))
++    if tail.isEmpty || now.contains(tail) { return .confirmed }
++    return .differs(after)
++}
++
++/// Poll the element until the write is confirmed or `timeout` elapses; apps
++/// commit edits asynchronously.
++func awaitWrite(
++    on element: AXUIElement,
++    timeout: TimeInterval = 0.4,
++    classify: (String?) -> WriteCheck
++) -> WriteCheck {
++    let deadline = ProcessInfo.processInfo.systemUptime + timeout
++    var check = classify(readableValue(of: element))
++    while check != .confirmed, ProcessInfo.processInfo.systemUptime < deadline {
++        Thread.sleep(forTimeInterval: 0.03)
++        check = classify(readableValue(of: element))
++    }
++    return check
++}
++
++func truncatedForMessage(_ text: String, limit: Int = 80) -> String {
++    let flat = comparableText(text)
++    return flat.count > limit ? String(flat.prefix(limit)) + "…" : flat
++}
++
++// MARK: - Action result diffs
++
++/// How an action reports the window afterwards.
++enum ActionResultMode: String {
++    /// The whole tree, as upstream does.
++    case full
++    /// Only the tree lines that changed, when the window is the same and few
++    /// lines changed; otherwise the whole tree.
++    case diff
++}
++
++func actionResultMode(environment: [String: String]) -> ActionResultMode {
++    let raw = environment["OPEN_COMPUTER_USE_ACTION_RESULT"]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
++    return raw.flatMap(ActionResultMode.init(rawValue:)) ?? .full
++}
++
++func actionScreenshotEnabled(environment: [String: String]) -> Bool {
++    guard let raw = environment["OPEN_COMPUTER_USE_ACTION_SCREENSHOT"]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() else {
++        return true
++    }
++    return !["0", "false", "no", "off"].contains(raw)
++}
++
++/// The changed lines between two renders of the same window, or nil when the
++/// whole tree should be returned instead. Lines carry their element index, so a
++/// line that is unchanged here also keeps its index: anything the caller learnt
++/// from the previous tree about unchanged lines stays valid.
++func treeDiffLines(previous: [String], current: [String], maxChanged: Int = 60) -> [String]? {
++    guard !previous.isEmpty, !current.isEmpty else { return nil }
++    var remaining = Dictionary(previous.map { ($0, 1) }, uniquingKeysWith: +)
++    var added: [String] = []
++    for line in current {
++        if let count = remaining[line], count > 0 {
++            remaining[line] = count - 1
++        } else {
++            added.append(line)
++        }
++    }
++    var removedBudget = remaining
++    var removed: [String] = []
++    for line in previous {
++        if let count = removedBudget[line], count > 0 {
++            removedBudget[line] = count - 1
++            removed.append(line)
++        }
++    }
++    let changed = added.count + removed.count
++    // Past a quarter of the tree the diff is no cheaper to read than the tree,
++    // and usually means indexes shifted.
++    guard changed <= maxChanged, changed * 4 <= max(current.count, previous.count) else { return nil }
++    if changed == 0 {
++        return ["(no accessibility tree changes; \(current.count) lines unchanged)"]
++    }
++    return ["(tree diff: \(added.count) added, \(removed.count) removed, \(current.count - added.count) unchanged lines omitted; indexes on unchanged lines are still valid)"]
++        + removed.map { "- " + $0.trimmingCharacters(in: .whitespaces) }
++        + added.map { "+ " + $0.trimmingCharacters(in: .whitespaces) }
++}
+diff --git a/packages/OpenComputerUseKit/Tests/OpenComputerUseKitTests/WriteVerificationTests.swift b/packages/OpenComputerUseKit/Tests/OpenComputerUseKitTests/WriteVerificationTests.swift
+new file mode 100644
+index 0000000..1da901c
+--- /dev/null
++++ b/packages/OpenComputerUseKit/Tests/OpenComputerUseKitTests/WriteVerificationTests.swift
+@@ -0,0 +1,74 @@
++import XCTest
++@testable import OpenComputerUseKit
++
++final class WriteVerificationTests: XCTestCase {
++    func testValueWriteConfirmedOnExactAndWhitespaceInsensitiveMatch() {
++        XCTAssertEqual(classifyValueWrite(requested: "Interview request", before: "", after: "Interview request"), .confirmed)
++        XCTAssertEqual(classifyValueWrite(requested: "a  b", before: nil, after: "a\u{00A0}b\u{200B}"), .confirmed)
++    }
++
++    func testValueWriteThatLeavesTheFieldAloneIsUnchanged() {
++        // The issue #83 repro: date steppers and selects that accept and ignore writes.
++        XCTAssertEqual(classifyValueWrite(requested: "15", before: "0", after: "0"), .unchanged("0"))
++        XCTAssertEqual(classifyValueWrite(requested: "Türkiye", before: "Seçiniz", after: "Seçiniz"), .unchanged("Seçiniz"))
++    }
++
++    func testUnchangedWinsOverContainmentWhenThePreviousValueAlreadyContainedTheRequest() {
++        XCTAssertEqual(classifyValueWrite(requested: "Hello", before: "Hello world", after: "Hello world"), .unchanged("Hello world"))
++    }
++
++    func testRewritingTheSameValueIsConfirmed() {
++        XCTAssertEqual(classifyValueWrite(requested: "same", before: "same", after: "same"), .confirmed)
++    }
++
++    func testNumericFormattingIsConfirmedAndOtherDifferencesReported() {
++        XCTAssertEqual(classifyValueWrite(requested: "1990", before: "0", after: "1,990"), .confirmed)
++        XCTAssertEqual(classifyValueWrite(requested: "abc", before: "", after: "ABD"), .differs("ABD"))
++        XCTAssertEqual(classifyValueWrite(requested: "abc", before: "", after: nil), .unreadable)
++    }
++
++    func testTextInsertionChecks() {
++        XCTAssertEqual(classifyTextInsertion(typed: " world", before: "hello", after: "hello world"), .confirmed)
++        XCTAssertEqual(classifyTextInsertion(typed: "a", before: "\n\nSent from Outlook for Mac", after: "\n\nSent from Outlook for Mac"),
++                       .unchanged("\n\nSent from Outlook for Mac"))
++        XCTAssertEqual(classifyTextInsertion(typed: "secret", before: "", after: "••••••"), .differs("••••••"))
++        XCTAssertEqual(classifyTextInsertion(typed: "x", before: nil, after: nil), .unreadable)
++        let long = String(repeating: "Dear Thomas, ", count: 20) + "Best, Lorik"
++        XCTAssertEqual(classifyTextInsertion(typed: long, before: "", after: long + "\n\nSent from Outlook for Mac"), .confirmed)
++    }
++
++    func testTreeDiffReportsOnlyChangedLines() throws {
++        let previous = (0..<40).map { "\t\($0) button B\($0)" } + ["\t40 text field Subject"]
++        let current = (0..<40).map { "\t\($0) button B\($0)" } + ["\t40 text field Subject Value: Hi"]
++        let diff = try XCTUnwrap(treeDiffLines(previous: previous, current: current))
++        XCTAssertEqual(diff.count, 3)
++        XCTAssertTrue(diff[0].contains("1 added, 1 removed"))
++        XCTAssertEqual(diff[1], "- 40 text field Subject")
++        XCTAssertEqual(diff[2], "+ 40 text field Subject Value: Hi")
++    }
++
++    func testTreeDiffFallsBackToTheFullTreeWhenIndexesShift() {
++        let previous = (0..<40).map { "\t\($0) button B\($0)" }
++        let current = ["\t0 dialog New"] + (0..<40).map { "\t\($0 + 1) button B\($0)" }
++        XCTAssertNil(treeDiffLines(previous: previous, current: current))
++    }
++
++    func testTreeDiffNoChangesAndEmptyInputs() {
++        let lines = ["\t0 window W", "\t1 button OK"]
++        XCTAssertEqual(treeDiffLines(previous: lines, current: lines)?.count, 1)
++        XCTAssertNil(treeDiffLines(previous: [], current: lines))
++    }
++
++    func testEnvironmentSwitches() {
++        XCTAssertEqual(actionResultMode(environment: [:]), .full)
++        XCTAssertEqual(actionResultMode(environment: ["OPEN_COMPUTER_USE_ACTION_RESULT": "Diff"]), .diff)
++        XCTAssertTrue(actionScreenshotEnabled(environment: [:]))
++        XCTAssertFalse(actionScreenshotEnabled(environment: ["OPEN_COMPUTER_USE_ACTION_SCREENSHOT": "0"]))
++    }
++
++    func testTextEntryMethodParsing() throws {
++        XCTAssertEqual(try parseTextEntryMethod(nil), .auto)
++        XCTAssertEqual(try parseTextEntryMethod(" Paste "), .paste)
++        XCTAssertThrowsError(try parseTextEntryMethod("clipboard"))
++    }
++}
+diff --git a/scripts/build-open-computer-use-app.sh b/scripts/build-open-computer-use-app.sh
+index 866d3b0..5b40625 100755
+--- a/scripts/build-open-computer-use-app.sh
++++ b/scripts/build-open-computer-use-app.sh
+@@ -259,7 +259,9 @@ bundle_identifier="com.ifuryst.opencomputeruse"
+ app_variant="release"
+ app_bundle_name="${release_app_bundle_name}"
+ 
+-if [[ "${configuration}" != "release" ]]; then
++# OPEN_COMPUTER_USE_APP_VARIANT=dev gives an optimized build the Dev bundle
++# identity, so a locally patched copy can sit next to the official app.
++if [[ "${configuration}" != "release" || "${OPEN_COMPUTER_USE_APP_VARIANT:-}" == "dev" ]]; then
+   bundle_display_name="Open Computer Use (Dev)"
+   bundle_identifier="com.ifuryst.opencomputeruse.dev"
+   app_variant="dev"
+-- 
+2.54.0 (Apple Git-157)
+

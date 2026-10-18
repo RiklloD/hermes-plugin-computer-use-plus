@@ -14,3 +14,6 @@ hermes-agent/
 .test-home/
 .native-home/
 .test-runtime/
+
+engine/dist/
+engine/.work/
