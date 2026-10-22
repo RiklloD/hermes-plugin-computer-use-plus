@@ -37,7 +37,7 @@ def observe():
 
 def _get(share, path, origin="null", token=True, headers=None):
     import urllib.request
-    h = {"Origin": origin, **(headers or {})}
+    h = {**({"Origin": origin} if origin is not None else {}), **(headers or {})}
     if token:
         h["Authorization"] = f"Bearer {share['token']}"
     req = urllib.request.Request(f"http://127.0.0.1:{share['port']}{path}", headers=h)
@@ -100,6 +100,10 @@ def test_every_route_needs_the_token_and_a_loopback_host(share):
     assert _status(share, "/v1/pair", token=False, origin="https://evil.example", headers=ua) == 403
     body = json.loads(_get(share, "/v1/pair", token=False, origin="null", headers=ua)[2])
     assert body["token"] == share["token"]
+    # Electron 40 sends no Origin from the file:// page, only Sec-Fetch-Mode: cors.
+    assert _status(share, "/v1/pair", token=False, origin=None, headers=ua) == 403
+    cors = {**ua, "Sec-Fetch-Mode": "cors"}
+    assert json.loads(_get(share, "/v1/pair", token=False, origin=None, headers=cors)[2])["token"] == share["token"]
     assert json.loads(commands.handle("token"))["token"] == share["token"]
 
 

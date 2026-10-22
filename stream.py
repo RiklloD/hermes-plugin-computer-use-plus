@@ -269,7 +269,11 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _is_desktop_renderer(self) -> bool:
         ua = self.headers.get("User-Agent") or ""
-        return self.headers.get("Origin") == "null" and "Electron/" in ua
+        # Electron 40 sends no Origin at all from the file:// page (older builds sent "null"). A web page
+        # can't get here: browsers always send its real Origin on a cross-site CORS fetch.
+        origin = self.headers.get("Origin")
+        cors_without_origin = origin is None and self.headers.get("Sec-Fetch-Mode") == "cors"
+        return (origin == "null" or cors_without_origin) and "Electron/" in ua
 
     # ── routes ──
 

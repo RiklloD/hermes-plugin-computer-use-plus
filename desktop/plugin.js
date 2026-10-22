@@ -20,6 +20,9 @@ const h = React.createElement
 const PLUGIN_ID = 'computer-use-plus'
 const PORTS = Array.from({ length: 10 }, (_, i) => 47831 + i)
 const POLL_MS = 700
+const IDLE_POLL_MS = 4000
+const HIDDEN_POLL_MS = 15000
+const PAIR_BACKOFF_MAX_MS = 60000
 const RESCAN_MS = 5000
 const STILL_MS = 3000 // refresh period of the cards behind the front one
 const MAX_CARDS = 4
@@ -110,19 +113,39 @@ function hostHasSessionAtom() {
   return Boolean(host.state && (host.state.activeSessionId || host.state.focusedSessionId))
 }
 
+// Poll fast only while an agent is driving apps; otherwise slowly, and back off while pairing fails.
+// Before this, a failed pairing re-ran the token command plus 20 port requests every 700 ms forever
+// (about 29 requests a second into the gateway, measured 22.10.2026).
+function nextDelay(sessions) {
+  if (document.hidden) return HIDDEN_POLL_MS
+  return sessions.some(s => s.watchable && !s.ended && s.apps && s.apps.length) ? POLL_MS : IDLE_POLL_MS
+}
+
 function startPolling(ctx) {
   let alive = new Set()
   let lastScan = 0
   let busy = false
+  let dueAt = 0
+  let pairFails = 0
+  let pairAt = 0
   const tick = async () => {
-    if (busy) return
+    if (busy || Date.now() < dueAt) return
     busy = true
     try {
       const now = Date.now()
       const scan = now - lastScan > RESCAN_MS || alive.size === 0
       if (scan) lastScan = now
       const targets = scan ? PORTS : [...alive]
-      if (!token) token = await getToken(targets)
+      if (!token) {
+        if (now < pairAt) return
+        token = await getToken(targets)
+        pairFails = token ? 0 : pairFails + 1
+        if (!token) {
+          pairAt = Date.now() + Math.min(PAIR_BACKOFF_MAX_MS, POLL_MS * 2 ** pairFails)
+          $state.set({ sessions: [], ports: [], error: 'unauthorized' })
+          return
+        }
+      }
       let unauthorized = false
       const results = await Promise.all(
         targets.map(async port => {
@@ -145,12 +168,17 @@ function startPolling(ctx) {
       }
       sessions.sort((a, b) => b.lastMs - a.lastMs)
       $state.set({ sessions, ports: [...alive], error: unauthorized && !ok.length ? 'unauthorized' : null })
+      dueAt = Date.now() + nextDelay(sessions)
     } finally {
       busy = false
     }
   }
   tick()
   ctx.setInterval(tick, POLL_MS)
+  // Back from hidden, or the user switched conversations: look again now.
+  ctx.addEventListener?.(document, 'visibilitychange', () => {
+    dueAt = 0
+  })
 }
 
 // The session the user is looking at: same Desktop session id, still watchable, with at least one window.
