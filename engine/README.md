@@ -15,11 +15,13 @@ patches (`patches/`), so exactly what differs from upstream is reviewable. `scri
 | Snapshots and action read-backs follow whichever window has focus, so indexes drift between windows | #83 finding 1 (High), open | `get_app_state window_id` / `window_title` pin a window; header lists windows; window changes are announced |
 | Every action returns the whole tree plus a screenshot | [#16](https://github.com/iFurySt/open-computer-use/issues/16), #83 finding 6a | `OPEN_COMPUTER_USE_ACTION_RESULT=diff` returns changed lines only; `OPEN_COMPUTER_USE_ACTION_SCREENSHOT=0` skips capture |
 | No clipboard entry for long text | #83 finding 6d | `type_text method=paste` (clipboard restored; falls back to typing when the app ignores Cmd+V) |
-| Nearby hit-testing converts window points as screenshot pixels (wrong spot when scaled, error without a screenshot) | not filed | Window points mapped directly |
 | A click on an element behind a sheet presses the sheet's button | not filed | Refused while a sheet covers the window |
+| #183's element check refuses every index action on TextEdit's text area (an identity attribute answers a generic error) | not filed | The error counts as no value, as the snapshot records it; a busy or gone element still refuses |
+| Keystroke fallbacks could type into another field when focus didn't move | not filed | Focus on the target is confirmed first, else nothing is sent |
 
-Already upstream and included by the pin: `query` (#73), `select_text` (#68), selective AX/screenshot collection
-(#101), background keyboard `key_method=sky_key` (#65).
+Already upstream and included by the pin (v1.1.5): `query` (#73), `select_text` (#68), selective AX/screenshot collection
+(#101), background keyboard `key_method=sky_key` (#65), window-point hit testing (#126), `type_text` replacing the
+selection (#130), exact `set_value` verification (#111), password values never read (#164).
 
 ## Identity
 

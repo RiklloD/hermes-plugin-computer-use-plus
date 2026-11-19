@@ -1,0 +1,70 @@
+From 05dcd26acd337de7faa246b01979ea3e29695776 Mon Sep 17 00:00:00 2001
+From: Lorik Dalloshi <lorik@Loriks-MacBook-Pro.local>
+Date: Sun, 18 Oct 2026 22:56:00 +0200
+Subject: [PATCH 2/4] fix(macos): paste fallback and sheet click guard
+
+- type_text method=paste falls back to keystrokes when the app ignores
+  Cmd+V (background apps), and any type_text without a known field says
+  the result is unverified.
+- Element clicks are refused while a sheet covers the window, instead of
+  pressing a sheet button that sits over the element.
+
+Dropped as superseded: window-point hit testing (upstream #126).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../ComputerUseService.swift                  | 24 ++++++++++++++++++-
+ 1 file changed, 23 insertions(+), 1 deletion(-)
+
+diff --git a/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/ComputerUseService.swift b/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/ComputerUseService.swift
+index 821b5b6..e90228c 100644
+--- a/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/ComputerUseService.swift
++++ b/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/ComputerUseService.swift
+@@ -846,6 +846,7 @@ public final class ComputerUseService {
+         if let elementIndex {
+             let record = try lookupElement(snapshot: snapshot, index: elementIndex)
+             try refuseDisabledControl(record, elementIndex: elementIndex)
++            try requireNotCoveredBySheet(record, in: snapshot)
+             guard let windowPoint = clickPoint(for: record, snapshot: snapshot) else {
+                 throw ComputerUseError.stateUnavailable("element \(elementIndex) has no clickable frame")
+             }
+@@ -969,7 +970,7 @@ public final class ComputerUseService {
+                 throw error
+             }
+ 
+-            rememberTextTarget(((try? hitTestElement(at: screenshotPoint, in: snapshot)) ?? nil)?.element, pid: snapshot.app.pid)
++            rememberTextTarget(((try? hitTestElement(at: point, in: snapshot)) ?? nil)?.element, pid: snapshot.app.pid)
+             pulseVisualCursor(at: cursorTarget, clickCount: clickCount, mouseButton: button)
+         } else {
+             throw ComputerUseError.invalidArguments("click requires either element_index or x/y")
+@@ -1188,6 +1189,27 @@ public final class ComputerUseService {
+         }
+     }
+ 
++    /// A sheet (save prompt, alert) over the window takes every click aimed at
++    /// the window beneath it, so a click on an element behind the sheet would
++    /// press one of the sheet's buttons instead. Refuse it.
++    private func requireNotCoveredBySheet(_ record: ElementRecord, in snapshot: AppSnapshot) throws {
++        guard let window = snapshot.windowElement, let element = record.element else {
++            return
++        }
++        let sheets = copyChildren(of: window).filter { stringValue(of: $0, attribute: kAXRoleAttribute) == "AXSheet" }
++        guard !sheets.isEmpty else { return }
++        var current: AXUIElement? = element
++        for _ in 0..<64 {
++            guard let node = current else { break }
++            if sheets.contains(where: { CFEqual($0, node) }) { return }
++            current = copyParent(of: node)
++        }
++        throw ComputerUseError.stateUnavailable(
++            "A sheet or dialog is covering this window, so a click on element \(record.index) would land on the dialog instead. "
++                + "Handle the dialog first (its buttons are in the tree), then call get_app_state again."
++        )
++    }
++
+     private func deliverKey(_ key: String, keyMethod: KeyMethod, snapshot: AppSnapshot) throws {
+         if keyMethod == .skyKey {
+             let target = try skyKeyTarget(for: snapshot)
+-- 
+2.54.0 (Apple Git-157)
+
