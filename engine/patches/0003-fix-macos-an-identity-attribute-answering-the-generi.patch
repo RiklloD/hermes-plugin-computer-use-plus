@@ -1,0 +1,67 @@
+From 0e75c94f33354280cb0e73748784f97363f39c04 Mon Sep 17 00:00:00 2001
+From: Lorik Dalloshi <lorik@Loriks-MacBook-Pro.local>
+Date: Thu, 19 Nov 2026 22:14:13 +0100
+Subject: [PATCH 3/4] fix(macos): an identity attribute answering the generic
+ AX failure is absent
+
+The element identity check (#183) re-reads role, subrole, title,
+description and identifier before an index action and refused when any of
+them answered anything but attributeUnsupported or noValue. TextEdit's text
+view answers AXDescription with kAXErrorFailure on every read, while the
+snapshot recorded that attribute as absent, so every set_value, click or
+scroll on element index of the main text view was refused with "no longer
+has the identity the snapshot showed". The generic failure now counts as
+absent, as the snapshot already treats it; a busy (cannotComplete) or gone
+element still refuses.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../Sources/OpenComputerUseKit/ElementIdentity.swift     | 9 ++++++++-
+ .../OpenComputerUseKitTests/ElementIdentityTests.swift   | 9 +++++++++
+ 2 files changed, 17 insertions(+), 1 deletion(-)
+
+diff --git a/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/ElementIdentity.swift b/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/ElementIdentity.swift
+index 1f53315..75efbf6 100644
+--- a/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/ElementIdentity.swift
++++ b/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/ElementIdentity.swift
+@@ -48,7 +48,7 @@ struct ElementIdentity: Equatable {
+         for (name, value) in zip(names, list) {
+             if CFGetTypeID(value) == AXValueGetTypeID(), AXValueGetType(value as! AXValue) == .axError {
+                 var error = AXError.failure
+-                guard AXValueGetValue(value as! AXValue, .axError, &error), error == .attributeUnsupported || error == .noValue else { return nil }
++                guard AXValueGetValue(value as! AXValue, .axError, &error), identityAttributeIsAbsent(error) else { return nil }
+             } else if let text = value as? String { read[name] = text }
+             else if !(value is NSNull) { return nil }
+         }
+@@ -65,3 +65,10 @@ struct ElementIdentity: Equatable {
+                                description: read[kAXDescriptionAttribute], identifier: read[kAXIdentifierAttribute], value: value)
+     }
+ }
++
++/// An identity attribute that answers this error has no value, as the snapshot recorded it. The generic failure
++/// counts: some controls answer it for an attribute they never carry (TextEdit's text view for AXDescription, every
++/// time), and refusing on it made every index action on such a control fail. A busy or gone element still refuses.
++func identityAttributeIsAbsent(_ error: AXError) -> Bool {
++    error == .attributeUnsupported || error == .noValue || error == .failure
++}
+diff --git a/packages/OpenComputerUseKit/Tests/OpenComputerUseKitTests/ElementIdentityTests.swift b/packages/OpenComputerUseKit/Tests/OpenComputerUseKitTests/ElementIdentityTests.swift
+index 8bda86d..798a561 100644
+--- a/packages/OpenComputerUseKit/Tests/OpenComputerUseKitTests/ElementIdentityTests.swift
++++ b/packages/OpenComputerUseKit/Tests/OpenComputerUseKitTests/ElementIdentityTests.swift
+@@ -38,4 +38,13 @@ final class ElementIdentityTests: XCTestCase {
+         XCTAssertEqual(ElementIdentity(role: "AXButton", subrole: nil, title: " ", description: "Close", identifier: nil, value: nil).name, "Close",
+                        "the name is the title, else the description")
+     }
++
++    func testAnAttributeAnsweringTheGenericFailureIsAbsentButABusyElementIsUnchecked() {
++        // TextEdit's text view answers AXDescription with kAXErrorFailure on every read.
++        XCTAssertTrue(identityAttributeIsAbsent(.failure))
++        XCTAssertTrue(identityAttributeIsAbsent(.attributeUnsupported))
++        XCTAssertTrue(identityAttributeIsAbsent(.noValue))
++        XCTAssertFalse(identityAttributeIsAbsent(.cannotComplete))
++        XCTAssertFalse(identityAttributeIsAbsent(.invalidUIElement))
++    }
+ }
+-- 
+2.54.0 (Apple Git-157)
+

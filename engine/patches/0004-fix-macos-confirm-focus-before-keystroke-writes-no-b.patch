@@ -1,0 +1,132 @@
+From f4dc74f41ee86dfbf6836040717ebb72674de582 Mon Sep 17 00:00:00 2001
+From: Lorik Dalloshi <lorik@Loriks-MacBook-Pro.local>
+Date: Thu, 19 Nov 2026 22:23:00 +0100
+Subject: [PATCH 4/4] fix(macos): confirm focus before keystroke writes, no
+ blind paste resend, replace unreadable values
+
+Keystroke fallbacks now refuse when focus cannot be confirmed on the target
+field instead of typing into whatever holds focus. Paste is retyped only when
+nothing was selected (so an unchanged value proves the paste was ignored).
+A password field's unreadable value no longer counts as empty: Cmd+A selects
+it so the new text replaces it, and the result is reported unverified.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../ComputerUseService.swift                  | 59 ++++++++++++++-----
+ 1 file changed, 43 insertions(+), 16 deletions(-)
+
+diff --git a/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/ComputerUseService.swift b/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/ComputerUseService.swift
+index e90228c..8cfe9f8 100644
+--- a/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/ComputerUseService.swift
++++ b/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/ComputerUseService.swift
+@@ -1119,7 +1119,7 @@ public final class ComputerUseService {
+                             + "or key_method=\"sky_key\" to target the window directly."
+                     )
+                 }
+-                focusTextTarget(target)
++                try focusTextTarget(target, pid: pid)
+                 try requireUsableComputerUseSession()
+                 try InputSimulation.typeText(text, pid: pid)
+                 notes += textEntryReadBackNotes(typed: text, target: target, before: before)
+@@ -1145,8 +1145,12 @@ public final class ComputerUseService {
+         }
+ 
+         if let target, method != .keys {
+-            focusTextTarget(target)
++            try focusTextTarget(target, pid: pid)
+         }
++        // Whether the paste must change the field: with nothing selected, inserting non-empty
++        // text always does. Over a selection it may not (pasting "hello" over a selected
++        // "hello"), so an unchanged value proves nothing there.
++        let pasteMustChange = !text.isEmpty && target.flatMap(selectedRange(of:)).map { $0.length == 0 } == true
+         try requireUsableComputerUseSession()
+         switch method {
+         case .paste:
+@@ -1155,7 +1159,7 @@ public final class ComputerUseService {
+             }
+             // Background apps often ignore Cmd+V (key equivalents need an active
+             // menu bar); typing is the dependable fallback.
+-            if let target, case .unchanged = awaitWrite(on: target, timeout: 0.3, classify: {
++            if pasteMustChange, let target, case .unchanged = awaitWrite(on: target, timeout: 0.3, classify: {
+                 classifyTextInsertion(typed: text, before: before, after: $0)
+             }) {
+                 notes.append("Paste was ignored by the app (common for background apps); typed the text instead.")
+@@ -1263,13 +1267,26 @@ public final class ComputerUseService {
+         return element
+     }
+ 
+-    /// Give `element` keyboard focus through accessibility. Best effort: when an
+-    /// app refuses, the keystrokes still go to its existing focus.
+-    private func focusTextTarget(_ element: AXUIElement) {
+-        if boolValue(of: element, attribute: kAXFocusedAttribute) == true { return }
+-        if AXUIElementSetAttributeValue(element, kAXFocusedAttribute as CFString, kCFBooleanTrue) == .success {
++    /// Give `element` keyboard focus through accessibility and confirm it took. Keystrokes go to
++    /// whatever holds focus, so sending them after a refused focus would edit another field;
++    /// this throws instead. Focus counts as confirmed when the app's focused element is
++    /// `element`, or, for background apps that report no focused element, when `element`
++    /// itself answers AXFocused = true.
++    private func focusTextTarget(_ element: AXUIElement, pid: pid_t) throws {
++        if !textTargetHasFocus(element, pid: pid),
++           AXUIElementSetAttributeValue(element, kAXFocusedAttribute as CFString, kCFBooleanTrue) == .success {
+             Thread.sleep(forTimeInterval: 0.05)
+         }
++        guard textTargetHasFocus(element, pid: pid) else {
++            throw ComputerUseError.stateUnavailable(
++                "Could not move keyboard focus to the target text field, so no keys were sent. Click the field first, then try again."
++            )
++        }
++    }
++
++    private func textTargetHasFocus(_ element: AXUIElement, pid: pid_t) -> Bool {
++        if let current = Self.focusedElement(pid: pid) { return CFEqual(element, current) }
++        return boolValue(of: element, attribute: kAXFocusedAttribute) == true
+     }
+ 
+     private func isInsideWebArea(_ element: AXUIElement) -> Bool {
+@@ -1408,7 +1425,12 @@ public final class ComputerUseService {
+ 
+         settleVisualCursor(at: cursorTarget)
+         rememberTextTarget(element, pid: snapshot.app.pid)
+-        let notes = path == "accessibility" ? [] : ["set_value delivered via \(path); value confirmed."]
++        let notes: [String]
++        if isSecure {
++            notes = ["Unverified: set_value delivered via \(path) to a password field, whose value is never read back. Confirm through the app before relying on it."]
++        } else {
++            notes = path == "accessibility" ? [] : ["set_value delivered via \(path); value confirmed."]
++        }
+         return try actionResult(for: query, notes: notes)
+     }
+ 
+@@ -1416,17 +1438,22 @@ public final class ComputerUseService {
+     /// everything, type. Typing over a selection replaces it; an empty value
+     /// deletes it.
+     private func replaceTextWithKeystrokes(in element: AXUIElement, with value: String, pid: pid_t, currentValue: String?) throws {
+-        focusTextTarget(element)
+-        let length = (currentValue ?? "").utf16.count
+-        var range = CFRange(location: 0, length: length)
+-        let selectedAll = length == 0 || AXValueCreate(.cfRange, &range).map {
+-            AXUIElementSetAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, $0) == .success
+-        } == true
++        try focusTextTarget(element, pid: pid)
++        // An unreadable value (a password field is never read) is not an empty one: select
++        // everything with Cmd+A then, so the new text replaces what is there.
++        let knownEmpty = currentValue?.isEmpty == true
++        var selectedAll = knownEmpty
++        if !selectedAll, let currentValue {
++            var range = CFRange(location: 0, length: currentValue.utf16.count)
++            selectedAll = AXValueCreate(.cfRange, &range).map {
++                AXUIElementSetAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, $0) == .success
++            } == true
++        }
+         if !selectedAll {
+             try InputSimulation.pressKey("cmd+a", pid: pid)
+         }
+         if value.isEmpty {
+-            if length > 0 { try InputSimulation.pressKey("delete", pid: pid) }
++            if !knownEmpty { try InputSimulation.pressKey("delete", pid: pid) }
+         } else {
+             try InputSimulation.typeText(value, pid: pid)
+         }
+-- 
+2.54.0 (Apple Git-157)
+
